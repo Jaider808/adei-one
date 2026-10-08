@@ -706,3 +706,47 @@ describe('audioDomain — inventario (entries)', () => {
     }
   })
 })
+
+/* ── Verificación posterior (verify-after-clean) ── */
+
+/** FLAC con un bloque PADDING (tipo 1): relleno que el modo ligero no elimina. */
+const FLAC_WITH_PADDING = concat([
+  ascii('fLaC'),
+  FLAC_STREAMINFO,
+  flacBlock(vorbisComment(['TITLE=K']), 4, false),
+  flacBlock(ascii('PADDINGX'), 1, true),
+  ascii('AUDIODATA8'),
+])
+
+describe('audioDomain — verificación posterior (verify-after-clean)', () => {
+  it('FLAC light queda limpio (el PADDING no es metadata eliminable)', async () => {
+    const result = await stripMetadata({
+      bytes: FLAC_WITH_PADDING,
+      name: 'a.flac',
+      kind: 'flac',
+      config: { mode: 'light', blocks: ['vorbis'] },
+    })
+    expect(result.verification?.status).toBe('clean')
+  })
+
+  it('WAV light ["info"] queda limpio (JUNK/PAD es relleno, no metadata)', async () => {
+    const result = await stripMetadata({
+      bytes: WAV,
+      name: 'a.wav',
+      kind: 'wav',
+      config: { mode: 'light', blocks: ['info'] },
+    })
+    expect(result.verification?.status).toBe('clean')
+  })
+
+  it('FLAC light que conserva la carátula reporta "remaining"', async () => {
+    const result = await stripMetadata({
+      bytes: FLAC,
+      name: 'a.flac',
+      kind: 'flac',
+      config: { mode: 'light', blocks: ['vorbis'] },
+    })
+    expect(result.verification?.status).toBe('remaining')
+    expect(result.verification?.remaining).toBeGreaterThan(0)
+  })
+})

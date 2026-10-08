@@ -737,7 +737,10 @@ function scanFlac(bytes: Uint8Array): MetadataReport {
         removal: 'individual',
       })
     } else if (type === 1) {
-      entries.push({ where: 'FLAC > PADDING', key: 'PADDING', label: 'Relleno', value: '', size: len, sensitivity: 'low', removal: 'individual' })
+      // El relleno (PADDING) es estructural: el modo ligero NO lo elimina (solo
+      // el profundo). Marcarlo `individual` prometía un borrado seleccionable que
+      // el limpiador no hace en ligero → se declara `never` (relleno, no metadata).
+      entries.push({ where: 'FLAC > PADDING', key: 'PADDING', label: 'Relleno', value: '', size: len, sensitivity: 'low', removal: 'never' })
     } else {
       // Cualquier otro bloque (APPLICATION, SEEKTABLE, CUESHEET…): no se oculta.
       entries.push({ where: `FLAC > bloque ${type}`, key: `BLOCK_${type}`, value: '', size: len, sensitivity: 'low', removal: 'never' })
@@ -1118,7 +1121,9 @@ function scanWav(bytes: Uint8Array): MetadataReport {
         removal: 'individual',
       })
     } else if (id === 'JUNK' || id === 'PAD ') {
-      entries.push({ where: `RIFF > ${id.trim()}`, key: id.trim(), label: 'Relleno', value: '', size, sensitivity: 'low', removal: 'individual' })
+      // Relleno estructural: el modo ligero NO lo elimina (solo el profundo) y no
+      // hay bloque seleccionable para él → se declara `never`, no `individual`.
+      entries.push({ where: `RIFF > ${id.trim()}`, key: id.trim(), label: 'Relleno', value: '', size, sensitivity: 'low', removal: 'never' })
     }
     i = chunkEnd + (size & 1)
   }

@@ -12,27 +12,34 @@
  *     ©ART, álbum ©alb, año ©day, comentario ©cmt, género ©gen, trkn…).
  *   - 'gps'   → dentro de `moov/udta/meta/ilst` quita SOLO los frames ©xyz y
  *     ©loci (coordenadas); conserva el resto de udta/ilst.
- *   - 'junk'  → cajas basura free/skip/wide/uuid (top-level y en moov).
- *   - deep    → 'tags'+'gps'+'junk' (+ basura final no parseable).
+ *   - 'timestamps' → pone a cero creation_time/modification_time de
+ *     `mvhd`/`tkhd`/`mdhd` (mismo tamaño; NO toca duración ni escala).
+ *   - 'c2pa'  → elimina las cajas `uuid` de C2PA y de XMP (sensibilidad alta).
+ *   - 'junk'  → cajas basura free/skip/wide y los `uuid` desconocidos.
+ *   - deep    → 'tags'+'gps'+'junk'+'timestamps' (+ basura final no parseable).
+ *     Sigue eliminando TODAS las cajas `uuid`.
  *   - 'format' (técnico, nunca se borra) → duración/escala de tiempo de `mvhd`,
  *     resolución de `tkhd` y códecs (avc1/hvc1/vp09/mp4a…) del primer `stsd`.
  *   Se conservan SIEMPRE ftyp, mdat (contenido intacto) y moov/trak completos.
  * - mkv/webm (EBML/Matroska): elementos `ID(vint)+size(vint)+datos`.
  *   - 'tags'   → elimina el elemento Tags y el Title dentro de Info.
+ *   - 'timestamps' → sustituye DateUTC/MuxingApp/WritingApp de Info por Void
+ *     del mismo tamaño (el layout del Segment no se mueve).
  *   - 'attach' → elimina el elemento Attachments (archivos adjuntos).
  *   - 'junk'   → elimina los elementos Void del Segment.
- *   - deep     → todos los anteriores.
+ *   - deep     → 'tags'+'attach'+'junk'+'timestamps'.
  *   - 'format' (técnico, nunca se borra) → duración (Duration×TimecodeScale)
  *     y pistas del elemento Tracks (tipo, códec, resolución, frecuencia).
  * - avi (RIFF): `"RIFF"+size(4LE)+"AVI "` + chunks `id(4)+size(4LE)+datos+pad`.
- *   - 'info' → quita el LIST interior de tipo "INFO" (INAM/IART/ISFT/ICMT…).
+ *   - 'info' → quita el LIST interior de tipo "INFO" (INAM/IART/ISFT/ICMT…) y el
+ *     chunk IDIT de nivel superior (fecha de digitalización).
  *   - 'junk' → quita los chunks JUNK y 'PAD '.
  *   - deep   → ambos.
  *   - 'format' (técnico, nunca se borra) → FPS/resolución/duración de `avih` y
  *     código de `strh` (fccHandler).
  */
 import { EMPTY_REPORT, shortHex } from './domain'
-import { asciiAt, concat, patchMp4Stco, readU32BE, readU32LE, writeU32LE } from './chunks'
+import { asciiAt, concat, patchMp4Stco, readU32BE, readU32LE, writeU32BE, writeU32LE } from './chunks'
 import type { MetaDomain, Reporter, StripConfig } from './domain'
 import type { FileKind, MetadataBlock, MetadataField, MetadataReport, MetaEntry, MetaRemoval } from '@/core/types'
 
@@ -43,11 +50,15 @@ const BLOCK_GPS = 'gps'
 const BLOCK_JUNK = 'junk'
 const BLOCK_INFO = 'info'
 const BLOCK_ATTACH = 'attach'
+/** Bloque de privacidad: fechas de grabación y software de muxing (mp4 y mkv). */
+const BLOCK_TIMESTAMPS = 'timestamps'
+/** Bloque de privacidad: C2PA/Content Credentials y XMP (cajas `uuid`). */
+const BLOCK_C2PA = 'c2pa'
 /** Bloque técnico de formato (estructura del contenedor): NUNCA se borra. */
 const BLOCK_FORMAT = 'format'
 
 /** Cajas ISO-BMFF consideradas basura (bloque 'junk' y modo 'deep'). */
-const MP4_JUNK_TYPES: ReadonlySet<string> = new Set(['free', 'skip', 'wide', 'uuid'])
+const MP4_JUNK_TYPES: ReadonlySet<string> = new Set(['free', 'skip', 'wide'])
 
 /** IDs EBML/Matroska que interesan al dominio. */
 const EBML_HEADER_ID = 0x1a45dfa3
@@ -218,21 +229,39 @@ function findMp4Box(bytes: Uint8Array, start: number, end: number, wanted: strin
   return null
 }
 
-/** ¿Hay cajas basura (free/skip/wide/uuid) en el rango? */
+/** ¿Hay cajas basura (free/skip/wide, o `uuid` desconocido) en el rango? */
 function hasMp4Junk(bytes: Uint8Array, start: number, end: number): boolean {
   let offset = start
   while (offset + 8 <= end) {
     const box = readMp4Box(bytes, offset, end)
     if (!box) break
-    if (MP4_JUNK_TYPES.has(box.type)) return true
+    if (box.type === 'uuid') {
+      if (uuidKind(bytes, box) === 'other') return true
+    } else if (MP4_JUNK_TYPES.has(box.type)) {
+      return true
+    }
     offset = box.end
   }
   return false
 }
 
-/** ¿Se elimina esta caja por el bloque 'junk' (o en modo 'deep')? */
-function dropsJunk(boxType: string, config: StripConfig): boolean {
-  return MP4_JUNK_TYPES.has(boxType) && (config.mode === 'deep' || config.blocks.includes(BLOCK_JUNK))
+/** ¿El bloque `block` se pidió explícitamente, o estamos en modo profundo? */
+function wantsBlock(config: StripConfig, block: string): boolean {
+  return config.mode === 'deep' || config.blocks.includes(block)
+}
+
+/**
+ * ¿Se elimina esta caja ISO-BMFF? `uuid` se clasifica por su identificador: las
+ * de C2PA/XMP caen en el bloque `c2pa` y el resto en `junk`. El scan y el strip
+ * usan ESTA misma función/clasificación, así el inventario nunca miente.
+ */
+function dropsMp4Box(bytes: Uint8Array, box: Mp4Box, config: StripConfig): boolean {
+  if (box.type === 'uuid') {
+    const kind = uuidKind(bytes, box)
+    if (kind === 'c2pa' || kind === 'xmp') return wantsBlock(config, BLOCK_C2PA)
+    return wantsBlock(config, BLOCK_JUNK)
+  }
+  return MP4_JUNK_TYPES.has(box.type) && wantsBlock(config, BLOCK_JUNK)
 }
 
 /** Etiquetas de los items de `ilst` (títulos/artista…). */
@@ -279,10 +308,14 @@ function rebuildMoov(bytes: Uint8Array, moov: Mp4Box, config: StripConfig): Uint
     // 'tags' (o deep) se elimina entera; `moov>meta` NO tiene offsets de
     // chunks propios, así que el remux stco/co64 se encarga del resto.
     if (box.type === 'meta' && (config.mode === 'deep' || config.blocks.includes(BLOCK_TAGS))) return
-    if (dropsJunk(box.type, config)) return
+    if (dropsMp4Box(bytes, box, config)) return
     children.push(bytes.slice(box.start, box.end))
   })
-  return makeMp4Box('moov', concat(children))
+  const out = makeMp4Box('moov', concat(children))
+  // T1: cero de fechas SOBRE el moov reconstruido (mismo tamaño), para que el
+  // parcheo de stco/co64 posterior siga operando sobre estos mismos bytes.
+  if (wantsBlock(config, BLOCK_TIMESTAMPS)) zeroContainerTimes(out, 8, out.length)
+  return out
 }
 
 /** Reconstruye `udta` conservando meta/ilst salvo los frames GPS (©xyz, ©loci). */
@@ -354,7 +387,7 @@ function stripMp4(bytes: Uint8Array, config: StripConfig): Uint8Array {
       running += moovBytes.length
       continue
     }
-    if (dropsJunk(box.type, config)) continue
+    if (dropsMp4Box(bytes, box, config)) continue
     pieces.push(bytes.slice(box.start, box.end))
     running += box.end - box.start
   }
@@ -388,6 +421,54 @@ function readMvhd(bytes: Uint8Array, mvhd: Mp4Box): { timescale: number; duratio
     return { timescale, durationSec: readU64BE(bytes, d + 24) / timescale }
   }
   return null
+}
+
+/**
+ * `creation_time`/`modification_time` de una FullBox (mvhd/tkhd/mdhd):
+ * v0 → 4 bytes cada uno; v1 → 8 bytes cada uno. null si el payload es corto.
+ */
+function readFullBoxTimes(bytes: Uint8Array, box: Mp4Box): { creation: number; modification: number } | null {
+  const d = box.dataStart
+  const tail = box.end - d
+  const version = bytes[d]
+  if (version === 0 && tail >= 12) {
+    return { creation: readU32BE(bytes, d + 4), modification: readU32BE(bytes, d + 8) }
+  }
+  if (version === 1 && tail >= 20) {
+    return { creation: readU64BE(bytes, d + 4), modification: readU64BE(bytes, d + 12) }
+  }
+  return null
+}
+
+/** Pone a cero (in situ, mismo tamaño) las fechas de una FullBox mvhd/tkhd/mdhd. */
+function zeroFullBoxTimes(bytes: Uint8Array, box: Mp4Box): void {
+  const d = box.dataStart
+  const tail = box.end - d
+  const version = bytes[d]
+  if (version === 0 && tail >= 12) {
+    writeU32BE(bytes, d + 4, 0)
+    writeU32BE(bytes, d + 8, 0)
+  } else if (version === 1 && tail >= 20) {
+    writeU32BE(bytes, d + 4, 0)
+    writeU32BE(bytes, d + 8, 0)
+    writeU32BE(bytes, d + 12, 0)
+    writeU32BE(bytes, d + 16, 0)
+  }
+}
+
+/**
+ * Recorre `moov`/`trak`/`mdia` y pone a cero las fechas de mvhd/tkhd/mdhd.
+ * NO desciende dentro de las FullBox (su payload no son cajas): el resto de
+ * campos (duración, escala, resolución) queda intacto.
+ */
+function zeroContainerTimes(bytes: Uint8Array, start: number, end: number): void {
+  walkMp4(bytes, start, end, (box) => {
+    if (box.type === 'mvhd' || box.type === 'tkhd' || box.type === 'mdhd') {
+      zeroFullBoxTimes(bytes, box)
+      return
+    }
+    if (box.type === 'trak' || box.type === 'mdia') zeroContainerTimes(bytes, box.dataStart, box.end)
+  })
 }
 
 /** `trak>tkhd` (FullBox v0/v1): resolución 16.16 al final del payload (84/96 B). */
@@ -468,6 +549,38 @@ function formatFieldsMp4(bytes: Uint8Array, moov: Mp4Box): MetadataField[] {
   return fields
 }
 
+/**
+ * Campos de privacidad de ISO-BMFF (fechas de mvhd/tkhd/mdhd) → bloque
+ * 'timestamps'. Solo se listan fechas reales (≠ 0): no se declara borrado de
+ * algo que ya está a cero.
+ */
+function collectMp4TimeFields(bytes: Uint8Array, moov: Mp4Box): MetadataField[] {
+  const fields: MetadataField[] = []
+  const push = (name: string, value: string): void => {
+    if (!value) return
+    if (fields.some((f) => f.name === name && f.value === value)) return
+    fields.push({ name, value, sensitivity: 'medium' })
+  }
+  const scanBox = (box: Mp4Box): void => {
+    const times = readFullBoxTimes(bytes, box)
+    if (!times) return
+    push('Fecha de creación', mp4TimeText(times.creation))
+    push('Fecha de modificación', mp4TimeText(times.modification))
+  }
+  const mvhd = findMp4Box(bytes, moov.dataStart, moov.end, 'mvhd')
+  if (mvhd) scanBox(mvhd)
+  walkMp4(bytes, moov.dataStart, moov.end, (box) => {
+    if (box.type !== 'trak') return
+    const tkhd = findMp4Box(bytes, box.dataStart, box.end, 'tkhd')
+    if (tkhd) scanBox(tkhd)
+    const mdia = findMp4Box(bytes, box.dataStart, box.end, 'mdia')
+    if (!mdia) return
+    const mdhd = findMp4Box(bytes, mdia.dataStart, mdia.end, 'mdhd')
+    if (mdhd) scanBox(mdhd)
+  })
+  return fields
+}
+
 /** Escanea metadata de un contenedor ISO-BMFF (mp4/mov). Nunca lanza. */
 function scanMp4(bytes: Uint8Array): MetadataReport {
   try {
@@ -519,6 +632,25 @@ function scanMp4(bytes: Uint8Array): MetadataReport {
     }
     for (const meta of moovMetaBoxes) scanIlst(meta)
 
+    // C2PA/Content Credentials y XMP: cajas `uuid` clasificadas con el MISMO
+    // criterio que el strip (`uuidKind`), para que el inventario no prometa un
+    // borrado que el limpiador no haría.
+    const c2paFields: MetadataField[] = []
+    const pushC2pa = (label: string): void => {
+      if (c2paFields.some((f) => f.name === label)) return
+      c2paFields.push({ name: label, value: label, sensitivity: 'high' })
+    }
+    const collectUuid = (box: Mp4Box): void => {
+      const kind = uuidKind(bytes, box)
+      if (kind === 'c2pa' || kind === 'xmp') pushC2pa(uuidLabel(kind))
+    }
+    walkMp4(bytes, 0, bytes.length, (box) => {
+      if (box.type === 'uuid') collectUuid(box)
+    })
+    walkMp4(bytes, moov.dataStart, moov.end, (box) => {
+      if (box.type === 'uuid') collectUuid(box)
+    })
+
     const blocks: MetadataBlock[] = []
     // El GPS vive en la MISMA caja que título/artista: no se puede borrar uno
     // sin el otro, así que se muestra TODO dentro del bloque 'tags' (evita
@@ -527,10 +659,22 @@ function scanMp4(bytes: Uint8Array): MetadataReport {
     if (tagsFields.length > 0) {
       blocks.push({ id: BLOCK_TAGS, label: 'Etiquetas (título/artista/ubicación)', fields: tagsFields, removableIn: 'light' })
     }
+    if (c2paFields.length > 0) {
+      blocks.push({
+        id: BLOCK_C2PA,
+        label: 'Credenciales de contenido (C2PA/XMP)',
+        fields: c2paFields,
+        removableIn: 'light',
+      })
+    }
+    const timeFields = collectMp4TimeFields(bytes, moov)
+    if (timeFields.length > 0) {
+      blocks.push({ id: BLOCK_TIMESTAMPS, label: 'Fechas de grabación', fields: timeFields, removableIn: 'light' })
+    }
     if (junkFound) {
       blocks.push({
         id: BLOCK_JUNK,
-        label: 'Cajas basura (free/skip/wide)',
+        label: 'Cajas basura (free/skip/wide/uuid)',
         fields: [{ name: 'Cajas basura', value: 'Presentes', sensitivity: 'low' }],
         removableIn: 'light',
       })
@@ -564,32 +708,45 @@ function normalizeKey(type: string): string {
 const UUID_XMP = 'be7acfcb97a942e89c71999491e3afac'
 const UUID_C2PA = 'd8fec3d61b0e483c92975828877c0c85'
 
+/** Clase de una caja `uuid` según su identificador de 16 bytes. */
+type UuidKind = 'c2pa' | 'xmp' | 'other'
+
+/** Hex (minúsculas) del identificador de una caja `uuid`. */
+function uuidHex(bytes: Uint8Array, box: Mp4Box): string {
+  const raw = bytes.slice(box.dataStart, Math.min(box.dataStart + 16, box.end))
+  return [...raw].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** Clasifica una caja `uuid`: C2PA, XMP o desconocido (→ bloque `junk`). */
+function uuidKind(bytes: Uint8Array, box: Mp4Box): UuidKind {
+  const hex = uuidHex(bytes, box)
+  if (hex === UUID_C2PA) return 'c2pa'
+  if (hex === UUID_XMP) return 'xmp'
+  return 'other'
+}
+
+/** Etiqueta legible del UUID para el inventario. */
+function uuidLabel(kind: UuidKind): string {
+  return kind === 'c2pa' ? 'C2PA' : kind === 'xmp' ? 'XMP' : 'UUID desconocido'
+}
+
 /** Formatea un tiempo ISO-BMFF (segundos desde 1904-01-01) para el visor. */
 function mp4TimeText(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return 'No definido'
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
   const date = new Date(Date.UTC(1904, 0, 1) + seconds * 1000)
-  if (Number.isNaN(date.getTime())) return 'No definido'
+  if (Number.isNaN(date.getTime())) return ''
   return `${date.toISOString().replace('T', ' ').slice(0, 19)} (UTC)`
 }
 
 /** Entradas creation/modification_time de una cabecera FullBox (mvhd/tkhd/mdhd). */
 function pushMp4Times(bytes: Uint8Array, box: Mp4Box, path: string, entries: MetaEntry[]): void {
-  const d = box.dataStart
-  const tail = box.end - d
-  const version = bytes[d]
-  let creation = 0
-  let modification = 0
-  if (version === 0 && tail >= 12) {
-    creation = readU32BE(bytes, d + 4)
-    modification = readU32BE(bytes, d + 8)
-  } else if (version === 1 && tail >= 20) {
-    creation = readU64BE(bytes, d + 4)
-    modification = readU64BE(bytes, d + 12)
-  } else {
-    return
-  }
-  entries.push({ where: path, key: 'creation_time', label: 'Fecha de creación', value: mp4TimeText(creation), sensitivity: 'medium', removal: 'never' })
-  entries.push({ where: path, key: 'modification_time', label: 'Fecha de modificación', value: mp4TimeText(modification), sensitivity: 'medium', removal: 'never' })
+  const times = readFullBoxTimes(bytes, box)
+  if (!times) return
+  // El strip puede ponerlas a cero in situ (bloque 'timestamps'): se borra la
+  // entrada, sin arrastrar su contenedor. Una fecha a cero se representa vacía
+  // (`mp4TimeText`), así el inventario la lista pero no cuenta como metadata.
+  entries.push({ where: path, key: 'creation_time', label: 'Fecha de creación', value: mp4TimeText(times.creation), sensitivity: 'medium', removal: 'individual' })
+  entries.push({ where: path, key: 'modification_time', label: 'Fecha de modificación', value: mp4TimeText(times.modification), sensitivity: 'medium', removal: 'individual' })
 }
 
 /** Payload del atom `data` de un item de `ilst`/`udta` (tras versión/locale). */
@@ -631,9 +788,9 @@ function pushIlstEntries(bytes: Uint8Array, meta: Mp4Box, path: string, entries:
 
 /** Entrada de una caja `uuid`, clasificada por su identificador (C2PA/XMP/otro). */
 function pushUuidEntry(bytes: Uint8Array, box: Mp4Box, where: string, entries: MetaEntry[]): void {
+  const kind = uuidKind(bytes, box)
   const uuid = bytes.slice(box.dataStart, Math.min(box.dataStart + 16, box.end))
-  const hexId = [...uuid].map((b) => b.toString(16).padStart(2, '0')).join('')
-  const label = hexId === UUID_C2PA ? 'C2PA' : hexId === UUID_XMP ? 'XMP' : 'UUID desconocido'
+  const label = uuidLabel(kind)
   entries.push({
     where,
     key: 'uuid',
@@ -641,7 +798,9 @@ function pushUuidEntry(bytes: Uint8Array, box: Mp4Box, where: string, entries: M
     value: label,
     size: box.end - box.start,
     hex: shortHex(uuid),
-    sensitivity: 'medium',
+    // C2PA/XMP son contenido de procedencia (sensibilidad alta); un uuid
+    // desconocido sigue siendo basura (medium, como hasta ahora).
+    sensitivity: kind === 'other' ? 'medium' : 'high',
     removal: 'individual',
   })
 }
@@ -649,12 +808,13 @@ function pushUuidEntry(bytes: Uint8Array, box: Mp4Box, where: string, entries: M
 /** Inventario exhaustivo de un contenedor ISO-BMFF (mp4/mov). Nunca lanza. */
 function mp4Entries(bytes: Uint8Array, moov: Mp4Box): MetaEntry[] {
   const entries: MetaEntry[] = []
-  // `uuid` de nivel superior: el strip lo borra con el bloque 'junk'/deep.
+  // `uuid` de nivel superior: el strip lo borra con 'c2pa' (C2PA/XMP) o 'junk'
+  // (desconocido), y en deep con cualquiera de los dos.
   walkMp4(bytes, 0, bytes.length, (box) => {
     if (box.type === 'uuid') pushUuidEntry(bytes, box, 'uuid', entries)
   })
-  // `uuid` hijo DIRECTO de `moov`: el strip también lo borra ('junk'/deep,
-  // rebuildMoov), así que debe verse en el inventario como `moov > uuid`.
+  // `uuid` hijo DIRECTO de `moov`: el strip también lo borra ('c2pa'/'junk'/
+  // deep, rebuildMoov), así que debe verse en el inventario como `moov > uuid`.
   walkMp4(bytes, moov.dataStart, moov.end, (box) => {
     if (box.type === 'uuid') pushUuidEntry(bytes, box, 'moov > uuid', entries)
   })
@@ -852,12 +1012,21 @@ function voidFiller(total: number): Uint8Array {
   return out
 }
 
-/** Reconstruye `Info` sustituyendo el `Title` por un Void del mismo tamaño. */
+/**
+ * Reconstruye `Info` sustituyendo por Void del mismo tamaño el `Title` (bloque
+ * 'tags') y `DateUTC`/`MuxingApp`/`WritingApp` (bloque 'timestamps').
+ */
 function rebuildMkvInfo(bytes: Uint8Array, info: EbmlElement, config: StripConfig): Uint8Array {
   const dropTitle = config.mode === 'deep' || config.blocks.includes(BLOCK_TAGS)
+  // 'timestamps' entra en deep: el modo profundo promete TODOS los bloques.
+  const dropTimestamps = wantsBlock(config, BLOCK_TIMESTAMPS)
   const children: Uint8Array[] = []
   walkEbml(bytes, info.dataStart, info.end, (el) => {
     if (el.id === MKV_TITLE && dropTitle) {
+      children.push(voidFiller(el.end - el.start))
+      return
+    }
+    if (dropTimestamps && (el.id === MKV_DATE_UTC || el.id === MKV_MUXING_APP || el.id === MKV_WRITING_APP)) {
       children.push(voidFiller(el.end - el.start))
       return
     }
@@ -1047,9 +1216,11 @@ function mkvEntries(bytes: Uint8Array, segment: EbmlElement): MetaEntry[] {
     if (el.id === MKV_INFO) {
       const infoItems: Array<[number, string, string, boolean, MetaRemoval]> = [
         [MKV_TITLE, 'Title', 'Título', false, 'individual'],
-        [MKV_DATE_UTC, 'DateUTC', 'Fecha (UTC)', false, 'never'],
-        [MKV_MUXING_APP, 'MuxingApp', 'Aplicación de multiplexado', false, 'never'],
-        [MKV_WRITING_APP, 'WritingApp', 'Aplicación de escritura', false, 'never'],
+        // DateUTC/MuxingApp/WritingApp se sustituyen por Void in situ (bloque
+        // 'timestamps'): borrado de la entrada, sin arrastrar su contenedor.
+        [MKV_DATE_UTC, 'DateUTC', 'Fecha (UTC)', false, 'individual'],
+        [MKV_MUXING_APP, 'MuxingApp', 'Aplicación de multiplexado', false, 'individual'],
+        [MKV_WRITING_APP, 'WritingApp', 'Aplicación de escritura', false, 'individual'],
         [MKV_SEGMENT_UID, 'SegmentUID', 'Identificador del segmento', true, 'never'],
       ]
       walkEbml(bytes, el.dataStart, el.end, (kid) => {
@@ -1127,12 +1298,36 @@ function mkvEntries(bytes: Uint8Array, segment: EbmlElement): MetaEntry[] {
   return entries
 }
 
+/** Fecha Matroska (DateUTC): entero de ns desde 2001-01-01 UTC → texto legible. */
+function mkvDateText(raw: Uint8Array): string {
+  if (raw.length !== 8) return 'Presente'
+  const ms = readU64BE(raw, 0) / 1e6
+  const date = new Date(Date.UTC(2001, 0, 1) + ms)
+  if (Number.isNaN(date.getTime())) return 'Presente'
+  return `${date.toISOString().replace('T', ' ').slice(0, 19)} (UTC)`
+}
+
+/** Campo del bloque 'timestamps' de Matroska (DateUTC/MuxingApp/WritingApp). */
+function mkvTimeField(bytes: Uint8Array, kid: EbmlElement): MetadataField | null {
+  if (kid.id === MKV_DATE_UTC) {
+    return { name: 'Fecha (UTC)', value: mkvDateText(bytes.slice(kid.dataStart, kid.end)), sensitivity: 'medium' }
+  }
+  if (kid.id === MKV_MUXING_APP) {
+    return { name: 'Aplicación de multiplexado', value: cap(DECODER.decode(bytes.slice(kid.dataStart, kid.end))), sensitivity: 'medium' }
+  }
+  if (kid.id === MKV_WRITING_APP) {
+    return { name: 'Aplicación de escritura', value: cap(DECODER.decode(bytes.slice(kid.dataStart, kid.end))), sensitivity: 'medium' }
+  }
+  return null
+}
+
 /** Escanea metadata de un contenedor EBML/Matroska (mkv/webm). Nunca lanza. */
 function scanMkv(bytes: Uint8Array): MetadataReport {
   try {
     const segment = findEbml(bytes, 0, bytes.length, MKV_SEGMENT)
     if (!segment) return EMPTY_REPORT
     const tagsFields: MetadataField[] = []
+    const timeFields: MetadataField[] = []
     let hasTags = false
     let attachments = 0
     let junkFound = false
@@ -1141,6 +1336,9 @@ function scanMkv(bytes: Uint8Array): MetadataReport {
         walkEbml(bytes, el.dataStart, el.end, (kid) => {
           if (kid.id === MKV_TITLE) {
             tagsFields.push({ name: 'Título', value: cap(DECODER.decode(bytes.slice(kid.dataStart, kid.end))), sensitivity: 'low' })
+          } else {
+            const field = mkvTimeField(bytes, kid)
+            if (field) timeFields.push(field)
           }
         })
       } else if (el.id === MKV_TAGS) {
@@ -1162,6 +1360,9 @@ function scanMkv(bytes: Uint8Array): MetadataReport {
       const fields = [...tagsFields]
       if (fields.length === 0) fields.push({ name: 'Etiquetas (Tags)', value: 'Presentes', sensitivity: 'medium' })
       blocks.push({ id: BLOCK_TAGS, label: 'Etiquetas (Tags/Title)', fields, removableIn: 'light' })
+    }
+    if (timeFields.length > 0) {
+      blocks.push({ id: BLOCK_TIMESTAMPS, label: 'Fechas y software de muxing', fields: timeFields, removableIn: 'light' })
     }
     if (attachments > 0) {
       blocks.push({
@@ -1247,7 +1448,7 @@ function walkAvi(bytes: Uint8Array, start: number, end: number, visit: (chunk: A
   }
 }
 
-/** Elimina metadata de un contenedor RIFF/AVI: LIST INFO + JUNK/PAD. */
+/** Elimina metadata de un contenedor RIFF/AVI: LIST INFO + IDIT de nivel superior + JUNK/PAD. */
 function stripAvi(bytes: Uint8Array, config: StripConfig): Uint8Array {
   if (bytes.length < 12 || asciiAt(bytes, 0) !== 'RIFF' || asciiAt(bytes, 8) !== 'AVI ') return bytes.slice()
   const wants = (block: string): boolean => config.mode === 'deep' || config.blocks.includes(block)
@@ -1261,8 +1462,10 @@ function stripAvi(bytes: Uint8Array, config: StripConfig): Uint8Array {
       break
     }
     const isInfo = chunk.listType === 'INFO'
+    const isIdit = chunk.id === 'IDIT'
     const isJunk = chunk.id === 'JUNK' || chunk.id === 'PAD '
-    const drop = (isInfo && wants(BLOCK_INFO)) || (isJunk && wants(BLOCK_JUNK))
+    // El IDIT de nivel superior es la fecha de digitalización: se va con el bloque 'info'.
+    const drop = (isInfo && wants(BLOCK_INFO)) || (isIdit && wants(BLOCK_INFO)) || (isJunk && wants(BLOCK_JUNK))
     if (!drop) parts.push(bytes.slice(chunk.start, chunk.end))
     offset = chunk.end
   }
@@ -1322,15 +1525,21 @@ function aviEntries(bytes: Uint8Array): MetaEntry[] {
       return
     }
     if (chunk.id === 'IDIT') {
-      entries.push({
-        where: 'RIFF > IDIT',
-        key: 'IDIT',
-        label: 'Fecha de digitalización',
-        value: cap(DECODER.decode(bytes.slice(chunk.dataStart, chunk.end))),
-        size: chunk.size,
-        sensitivity: 'medium',
-        removal: 'never',
-      })
+      // F5: `scanAvi` omite el IDIT sin valor (`if (value)`); el inventario debe
+      // hacer lo mismo para no declarar un borrado (`individual`) de un campo que
+      // el visor ni siquiera muestra. Sin valor → no es una entrada real.
+      const value = cap(DECODER.decode(bytes.slice(chunk.dataStart, chunk.end)))
+      if (value) {
+        entries.push({
+          where: 'RIFF > IDIT',
+          key: 'IDIT',
+          label: 'Fecha de digitalización',
+          value,
+          size: chunk.size,
+          sensitivity: 'medium',
+          removal: 'individual',
+        })
+      }
       return
     }
     if (chunk.listType !== 'INFO') return
@@ -1361,6 +1570,12 @@ function scanAvi(bytes: Uint8Array): MetadataReport {
         junkFound = true
         return
       }
+      if (chunk.id === 'IDIT') {
+        // Fecha de digitalización de nivel superior: comparte el bloque 'info'.
+        const value = cap(DECODER.decode(bytes.slice(chunk.dataStart, chunk.end)))
+        if (value) fields.push({ name: 'Fecha de digitalización', value, sensitivity: 'medium' })
+        return
+      }
       if (chunk.listType !== 'INFO') return
       walkAvi(bytes, chunk.dataStart + 4, chunk.end, (sub) => {
         const mapped = AVI_INFO_LABELS[sub.id]
@@ -1371,7 +1586,7 @@ function scanAvi(bytes: Uint8Array): MetadataReport {
     })
     const blocks: MetadataBlock[] = []
     if (fields.length > 0) {
-      blocks.push({ id: BLOCK_INFO, label: 'Información (LIST INFO)', fields, removableIn: 'light' })
+      blocks.push({ id: BLOCK_INFO, label: 'Información (LIST INFO/IDIT)', fields, removableIn: 'light' })
     }
     if (junkFound) {
       blocks.push({

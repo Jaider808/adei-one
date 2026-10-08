@@ -1,9 +1,9 @@
 /** @vitest-environment happy-dom */
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MetaStripView } from './view'
 import { stripMetadataTool } from './tool'
-import type { Artifact, MetadataReport } from '@/core/types'
+import type { Artifact, MetadataReport, RegenerationRisk } from '@/core/types'
 
 const engineMock = vi.hoisted(() => ({ scanMetadata: vi.fn() }))
 
@@ -408,6 +408,119 @@ describe('<MetaStripView /> — inventario', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Profundo/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Regenerar y limpiar todo' }))
+    expect(onSubmit).toHaveBeenCalledWith({ mode: 'deep', blocks: [] })
+  })
+})
+
+describe('<MetaStripView /> — avisos de regeneración inline', () => {
+  const deepRisk: RegenerationRisk = {
+    id: 'pdf-forms',
+    label: 'Formularios',
+    detail: 'El modo profundo elimina los formularios rellenables (2 campos).',
+    severity: 'high',
+    affects: 'deep',
+  }
+  const lightRisk: RegenerationRisk = {
+    id: 'image-orientation',
+    label: 'Orientación EXIF',
+    detail:
+      'El modo ligero re-codifica la imagen para enderezarla según su orientación EXIF: se pierde calidad.',
+    severity: 'medium',
+    affects: 'light',
+  }
+
+  it('explica un riesgo profundo dentro de la tarjeta Profundo y lo refleja en el botón', async () => {
+    renderView({ ...EMPTY, risks: [deepRisk] })
+
+    const deepCard = await screen.findByRole('button', { name: /Profundo/ })
+    expect(within(deepCard).getByText(deepRisk.detail)).toBeTruthy()
+
+    // Un aviso profundo no contamina la tarjeta Ligero.
+    const lightCard = screen.getByRole('button', { name: /Ligero/ })
+    expect(within(lightCard).queryByText(deepRisk.detail)).toBeNull()
+
+    // En Ligero (por defecto) el botón no refleja un aviso que no aplica.
+    expect(screen.queryByText(/Afecta a:/)).toBeNull()
+
+    // Al elegir Profundo, el propio botón refleja la consecuencia.
+    fireEvent.click(deepCard)
+    const action = screen.getByRole('button', { name: /Regenerar y limpiar todo/ })
+    expect(action.textContent).toContain('Afecta a: Formularios')
+  })
+
+  it('explica un riesgo de re-codificación dentro de la tarjeta Ligero y lo refleja en el botón', async () => {
+    renderView({ ...EMPTY, risks: [lightRisk] })
+
+    const lightCard = await screen.findByRole('button', { name: /Ligero/ })
+    expect(within(lightCard).getByText(lightRisk.detail)).toBeTruthy()
+
+    // Un aviso de re-codificación no contamina la tarjeta Profundo.
+    const deepCard = screen.getByRole('button', { name: /Profundo/ })
+    expect(within(deepCard).queryByText(lightRisk.detail)).toBeNull()
+
+    // Ligero es el modo por defecto: el botón ya refleja el aviso.
+    const action = screen.getByRole('button', { name: /Limpiar metadata/ })
+    expect(action.textContent).toContain('Afecta a: Orientación EXIF')
+  })
+
+  it('no añade ningún aviso ni ruido cuando el archivo no tiene riesgos', async () => {
+    renderView({
+      ...EMPTY,
+      entries: [
+        {
+          where: 'ID3v2 > TIT2',
+          key: 'TIT2',
+          label: 'Título',
+          value: 'Hola',
+          sensitivity: 'low',
+          removal: 'individual',
+        },
+      ],
+      blocks: [
+        {
+          id: 'id3v2',
+          label: 'Etiqueta ID3v2',
+          removableIn: 'light',
+          fields: [{ name: 'Título', value: 'Hola', sensitivity: 'low' }],
+        },
+      ],
+    })
+
+    await screen.findByText('Hola')
+    expect(screen.queryByText(/Afecta a:/)).toBeNull()
+
+    // Los botones conservan EXACTAMENTE su texto de siempre.
+    expect(screen.getByRole('button', { name: 'Limpiar metadata' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Profundo/ }))
+    expect(screen.getByRole('button', { name: 'Regenerar y limpiar todo' })).toBeTruthy()
+  })
+
+  it('mantiene el contrato de envío { mode, blocks } aunque existan riesgos', async () => {
+    const onSubmit = renderView({
+      ...EMPTY,
+      risks: [deepRisk],
+      blocks: [
+        {
+          id: 'id3v2',
+          label: 'Etiqueta ID3v2',
+          removableIn: 'light',
+          fields: [{ name: 'Título', value: 'Hola', sensitivity: 'low' }],
+        },
+      ],
+      entries: [
+        {
+          where: 'ID3v2 > TIT2',
+          key: 'TIT2',
+          label: 'Título',
+          value: 'Hola',
+          sensitivity: 'low',
+          removal: 'with-container',
+        },
+      ],
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: /Profundo/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Regenerar y limpiar todo/ }))
     expect(onSubmit).toHaveBeenCalledWith({ mode: 'deep', blocks: [] })
   })
 })

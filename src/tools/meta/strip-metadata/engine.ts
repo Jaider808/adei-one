@@ -28,6 +28,7 @@ import {
   PDFHexString,
   PDFName,
   PDFNumber,
+  PDFObject,
   PDFRawStream,
   PDFString,
   decodePDFRawStream,
@@ -70,6 +71,8 @@ import type {
   MetaEntry,
   ProcessResult,
   ProgressEvent,
+  RegenerationRisk,
+  VerificationResult,
 } from '@/core/types'
 
 /* ── Constantes y helpers generales ── */
@@ -124,12 +127,64 @@ function readConfig(config: ActionConfig): StripConfig {
   return { mode, blocks: raw.filter((b): b is string => typeof b === 'string') }
 }
 
-/** Constituye un ProcessResult y emite el evento final de progreso. */
-function done(kind: FileKind, name: string, bytes: Uint8Array, report: Reporter): ProcessResult {
+/**
+ * ¿Dos entradas del inventario describen el MISMO dato con el MISMO valor? Se
+ * compara la ruta y la clave cruda (identidad física) junto con el valor legible
+ * y el hex (contenido): un dato cuyo valor cambió ya no es el mismo dato. Un
+ * dato sin contenido (valor vacío y sin hex) no es metadata "presente" y no
+ * puede contarse como resto (p. ej. una fecha ISO-BMFF puesta a cero).
+ */
+function sameEntry(a: MetaEntry, b: MetaEntry): boolean {
+  if (a.value === '' && a.hex === undefined) return false
+  return a.where === b.where && a.key === b.key && a.value === b.value && (a.hex ?? '') === (b.hex ?? '')
+}
+
+/**
+ * Comprueba que los bytes limpios no conservan metadata eliminable comparando el
+ * inventario ANTES (bytes originales) y DESPUÉS (bytes limpios) con el mismo
+ * `scanMetadata`. Cuenta como restos solo las entradas eliminables del original
+ * (`removal !== 'never'`) que siguen presentes con el MISMO valor en el
+ * resultado: un dato cuyo valor cambió o desapareció (p. ej. una fecha puesta a
+ * cero) ya no está. Si NI el original NI el resultado se pudieron interpretar
+ * (dos reportes vacíos), informa 'unverifiable', nunca 'clean' a ciegas. NUNCA
+ * lanza: si el escaneo falla, la operación sigue y se informa 'unverifiable'.
+ */
+async function verifyClean(kind: FileKind, original: Uint8Array, cleaned: Uint8Array): Promise<VerificationResult> {
+  try {
+    const before = await scanMetadata({ bytes: original, kind })
+    const after = await scanMetadata({ bytes: cleaned, kind })
+    // `EMPTY_REPORT` significa "sin metadata" Y "no parseable"; dos reportes
+    // vacíos no permiten afirmar nada → 'unverifiable', jamás un 'clean' a ciegas.
+    if (before.entries.length === 0 && after.entries.length === 0) {
+      return { status: 'unverifiable' }
+    }
+    const leftovers = before.entries.filter(
+      (entry) => entry.removal !== 'never' && after.entries.some((candidate) => sameEntry(candidate, entry)),
+    )
+    if (leftovers.length === 0) return { status: 'clean' }
+    return {
+      status: 'remaining',
+      remaining: leftovers.length,
+      sample: leftovers.slice(0, 5).map((entry) => entry.label ?? entry.key),
+    }
+  } catch {
+    return { status: 'unverifiable' }
+  }
+}
+
+/** Constituye un ProcessResult (con verificación) y emite el evento final. */
+async function done(
+  kind: FileKind,
+  name: string,
+  original: Uint8Array,
+  bytes: Uint8Array,
+  report: Reporter,
+): Promise<ProcessResult> {
   report('Generando archivo', 90)
   const blob = blobFrom(bytes, mime(kind))
+  const verification = await verifyClean(kind, original, bytes)
   report('Listo', 100)
-  return { name, kind, blob, size: blob.size }
+  return { name, kind, blob, size: blob.size, verification }
 }
 
 /** Texto seguro para un campo (sin saltos de línea largos ni binario). */
@@ -179,18 +234,6 @@ function pdfValueToText(value: unknown): string {
   return String(value)
 }
 
-/** Claves del diccionario de información que `stripPdfLight` realmente vacía o elimina. */
-const PDF_INFO_REMOVABLE: ReadonlySet<string> = new Set([
-  'Title',
-  'Author',
-  'Subject',
-  'Keywords',
-  'Creator',
-  'Producer',
-  'CreationDate',
-  'ModDate',
-])
-
 /** Enumera TODAS las claves del diccionario de información (`/Title`, `/Author`… y las desconocidas). */
 function pushPdfInfoEntries(doc: PDFDocument, entries: MetaEntry[]): void {
   const infoRef = doc.context.trailerInfo.Info
@@ -207,9 +250,9 @@ function pushPdfInfoEntries(doc: PDFDocument, entries: MetaEntry[]): void {
       label: mapped?.label,
       value: txt(pdfValueToText(doc.context.lookup(rawValue))),
       sensitivity: mapped?.sensitivity ?? 'medium',
-      // Solo las claves que el limpiador vacía/elimina declaran borrado; una clave
-      // personalizada que `stripPdfLight` deja intacta NO puede prometerlo.
-      removal: PDF_INFO_REMOVABLE.has(key) ? 'with-container' : 'never',
+      // `stripPdfLight` elimina TODAS las claves del Info dict (incluidas las
+      // personalizadas): cualquiera puede declararse como eliminada.
+      removal: 'with-container',
     })
   }
 }
@@ -299,6 +342,115 @@ function extractXmpText(doc: PDFDocument, bytes: Uint8Array): string | null {
   return end < 0 ? raw.slice(start) : raw.slice(start, end + '</x:xmpmeta>'.length)
 }
 
+/* ── Avisos de regeneración (detección read-only; nunca cambia el strip) ── */
+
+/** ¿Algún campo del árbol AcroForm (incl. Kids) declara el tipo `/FT` pedido? */
+function acroFormHasFieldType(doc: PDFDocument, fields: PDFArray, wanted: string): boolean {
+  const seen = new Set<PDFDict>()
+  const visit = (node: PDFObject, depth: number): boolean => {
+    if (depth > 16) return false
+    const resolved = doc.context.lookup(node)
+    if (!(resolved instanceof PDFDict) || seen.has(resolved)) return false
+    seen.add(resolved)
+    const ft = resolved.get(PDFName.of('FT'))
+    const ftName = ft ? doc.context.lookup(ft) : undefined
+    if (ftName instanceof PDFName && ftName.asString() === wanted) return true
+    const kidsRef = resolved.get(PDFName.of('Kids'))
+    const kids = kidsRef ? doc.context.lookup(kidsRef) : undefined
+    if (kids instanceof PDFArray) {
+      for (let i = 0; i < kids.size(); i++) if (visit(kids.get(i), depth + 1)) return true
+    }
+    return false
+  }
+  for (let i = 0; i < fields.size(); i++) if (visit(fields.get(i), 0)) return true
+  return false
+}
+
+/** Cuenta las anotaciones de todas las páginas y cuántas son enlaces (`/Subtype /Link`). */
+function pdfAnnotationStats(doc: PDFDocument): { total: number; links: number } {
+  let total = 0
+  let links = 0
+  for (const page of doc.getPages()) {
+    const annotsRef = page.node.get(PDFName.of('Annots'))
+    const annots = annotsRef ? doc.context.lookup(annotsRef) : undefined
+    if (!(annots instanceof PDFArray)) continue
+    for (let i = 0; i < annots.size(); i++) {
+      total += 1
+      const annot = doc.context.lookup(annots.get(i))
+      if (!(annot instanceof PDFDict)) continue
+      const sub = annot.get(PDFName.of('Subtype'))
+      const subName = sub ? doc.context.lookup(sub) : undefined
+      if (subName instanceof PDFName && subName.asString() === '/Link') links += 1
+    }
+  }
+  return { total, links }
+}
+
+/**
+ * Avisos de regeneración de un PDF: qué pierde el modo profundo (rasteriza el
+ * documento). Solo emite avisos de rasgos REALMENTE presentes. Nunca lanza.
+ */
+function pdfRisks(doc: PDFDocument): RegenerationRisk[] {
+  const risks: RegenerationRisk[] = []
+  const acroRef = doc.catalog.get(PDFName.of('AcroForm'))
+  const acro = acroRef ? doc.context.lookup(acroRef) : undefined
+  if (acro instanceof PDFDict) {
+    const fieldsRef = acro.get(PDFName.of('Fields'))
+    const fields = fieldsRef ? doc.context.lookup(fieldsRef) : undefined
+    if (fields instanceof PDFArray && fields.size() > 0) {
+      const n = fields.size()
+      risks.push({
+        id: 'pdf-forms',
+        label: 'Formularios',
+        detail: `El modo profundo elimina los formularios rellenables (${n} ${n === 1 ? 'campo' : 'campos'}).`,
+        severity: 'high',
+        affects: 'deep',
+      })
+    }
+    const signed =
+      acro.has(PDFName.of('SigFlags')) ||
+      (fields instanceof PDFArray && acroFormHasFieldType(doc, fields, '/Sig'))
+    if (signed) {
+      risks.push({
+        id: 'pdf-signatures',
+        label: 'Firmas digitales',
+        detail: 'El modo profundo elimina las firmas digitales del documento.',
+        severity: 'high',
+        affects: 'deep',
+      })
+    }
+  }
+  const { total, links } = pdfAnnotationStats(doc)
+  if (links > 0) {
+    risks.push({
+      id: 'pdf-links',
+      label: 'Enlaces',
+      detail: `El modo profundo elimina los enlaces seleccionables (${links} ${links === 1 ? 'enlace' : 'enlaces'}).`,
+      severity: 'medium',
+      affects: 'deep',
+    })
+  }
+  if (total > 0) {
+    risks.push({
+      id: 'pdf-annotations',
+      label: 'Anotaciones',
+      detail: `El modo profundo elimina las anotaciones y comentarios (${total}).`,
+      severity: 'medium',
+      affects: 'deep',
+    })
+  }
+  if (doc.catalog.has(PDFName.of('Outlines'))) {
+    risks.push({
+      id: 'pdf-outlines',
+      label: 'Marcadores',
+      detail: 'El modo profundo elimina los marcadores (índice del documento).',
+      severity: 'medium',
+      affects: 'deep',
+    })
+  }
+  return risks
+}
+
 /** Escaneo PDF: toda clave del Info dict + toda propiedad XMP + datos técnicos (nunca lanza). */
 async function scanPdf(bytes: Uint8Array): Promise<MetadataReport> {
   try {
@@ -373,7 +525,13 @@ async function scanPdf(bytes: Uint8Array): Promise<MetadataReport> {
         })
       }
     }
-    return { fields, count: fields.length, blocks, entries }
+    let risks: RegenerationRisk[] = []
+    try {
+      risks = pdfRisks(doc)
+    } catch {
+      /* un PDF no interpretable no produce avisos */
+    }
+    return { fields, count: fields.length, blocks, entries, risks }
   } catch {
     return EMPTY_REPORT
   }
@@ -619,6 +777,14 @@ function readU16LE(bytes: Uint8Array, offset: number): number {
   return (bytes[offset] | (bytes[offset + 1] << 8)) >>> 0
 }
 
+/** ¿El WebP es animado? (chunk `ANMF` o `VP8X` con el flag de animación, bit 0x02). */
+function webpIsAnimated(bytes: Uint8Array): boolean {
+  const chunks = listWebpChunks(bytes)
+  if (chunks.some((c) => c.fourcc === 'ANMF')) return true
+  const vp8x = chunks.find((c) => c.fourcc === 'VP8X')
+  return !!vp8x && vp8x.data.length >= 1 && (vp8x.data[0] & 0x02) !== 0
+}
+
 /** Datos técnicos del formato (ancho/alto/bits) para el visor — NUNCA se borran. */
 function formatBlockFor(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'): MetadataBlock | null {
   const fields: MetadataField[] = []
@@ -778,8 +944,33 @@ async function scanBaseImage(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'): P
     }
   }
 
+  const risks: RegenerationRisk[] = []
+  try {
+    if (kind === 'webp' && webpIsAnimated(bytes)) {
+      risks.push({
+        id: 'webp-animated',
+        label: 'WebP animado',
+        detail: 'El modo profundo conserva solo el primer fotograma del WebP animado.',
+        severity: 'medium',
+        affects: 'deep',
+      })
+    }
+    const orientation = await readOrientation(bytes, kind)
+    if (orientation !== undefined && orientation > 1) {
+      risks.push({
+        id: 'image-orientation',
+        label: 'Orientación EXIF',
+        detail: 'El modo ligero re-codifica la imagen para enderezarla según su orientación EXIF: se pierde calidad.',
+        severity: 'medium',
+        affects: 'light',
+      })
+    }
+  } catch {
+    /* sin avisos */
+  }
+
   const flat = blocks.flatMap((b) => b.fields)
-  return { fields: flat, count: flat.length, blocks, entries }
+  return { fields: flat, count: flat.length, blocks, entries, risks }
 }
 
 /** Oficina OOXML: etiquetas a detectar → etiqueta + sensibilidad (prefijo ignorado). */
@@ -952,8 +1143,18 @@ function scanOffice(bytes: Uint8Array): MetadataReport {
     if (thumbHits.length) {
       blocks.push({ id: 'thumb', label: 'Miniatura', removableIn: 'light', fields: [{ name: 'Parte', value: thumbHits.join(', '), sensitivity: 'low' }] })
     }
+    const risks: RegenerationRisk[] = []
+    if (Object.keys(files).some((n) => /vbaProject|vbaData/i.test(n))) {
+      risks.push({
+        id: 'office-macros',
+        label: 'Macros',
+        detail: 'El modo profundo elimina las macros del documento (vbaProject).',
+        severity: 'high',
+        affects: 'deep',
+      })
+    }
     const flat = blocks.flatMap((b) => b.fields)
-    return { fields: flat, count: flat.length, blocks, entries }
+    return { fields: flat, count: flat.length, blocks, entries, risks }
   } catch {
     return EMPTY_REPORT
   }
@@ -1018,13 +1219,19 @@ export async function scanMetadata(input: { bytes: Uint8Array; kind: FileKind })
 
 /* ── Strip: PDF ── */
 
-/** Elimina las fechas del Info dict (lossless: la clave desaparece). pdf-lib 1.17 rechaza `undefined`. */
-function removeInfoDate(doc: PDFDocument, key: 'CreationDate' | 'ModDate'): void {
+/**
+ * Elimina TODAS las claves del diccionario de información (lossless: la clave
+ * desaparece). Se recogen las claves antes de borrar para no mutar el
+ * diccionario mientras se itera.
+ */
+function removeAllInfoEntries(doc: PDFDocument): void {
   const info = doc.context.lookup(doc.context.trailerInfo.Info)
-  if (info instanceof PDFDict) info.delete(PDFName.of(key))
+  if (!(info instanceof PDFDict)) return
+  const keys = info.keys()
+  for (const key of keys) info.delete(key)
 }
 
-/** PDF ligero (lossless): vacía los campos seleccionados y borra el stream XMP. */
+/** PDF ligero (lossless): borra TODAS las claves del Info dict y el stream XMP. */
 async function stripPdfLight(bytes: Uint8Array, config: StripConfig): Promise<Uint8Array> {
   // Sin bloques seleccionados: passthrough de los mismos bytes (nada que limpiar).
   if (config.blocks.length === 0) return bytes.slice()
@@ -1032,14 +1239,9 @@ async function stripPdfLight(bytes: Uint8Array, config: StripConfig): Promise<Ui
   const wantInfo = config.blocks.includes('info')
   const wantXmp = config.blocks.includes('xmp')
   if (wantInfo) {
-    doc.setTitle('')
-    doc.setAuthor('')
-    doc.setSubject('')
-    doc.setKeywords([])
-    doc.setCreator('')
-    doc.setProducer('')
-    removeInfoDate(doc, 'CreationDate')
-    removeInfoDate(doc, 'ModDate')
+    // Se eliminan TODAS las claves (no solo Title/Author/…): una clave
+    // personalizada (`/MyCustomKey`) también desaparece.
+    removeAllInfoEntries(doc)
   }
   if (wantXmp && doc.catalog.has(PDFName.of('Metadata'))) {
     doc.catalog.delete(PDFName.of('Metadata'))
@@ -1256,14 +1458,14 @@ export async function stripMetadata(
     case 'pdf': {
       report('Limpiando metadata', 50)
       const bytes = config.mode === 'deep' ? await stripPdfDeep(input, report) : await stripPdfLight(input.bytes, config)
-      return done('pdf', cleanedName(input.name), bytes, report)
+      return done('pdf', cleanedName(input.name), input.bytes, bytes, report)
     }
     case 'docx':
     case 'xlsx':
     case 'pptx': {
       report('Limpiando metadata', 50)
       const bytes = await stripOffice(input.bytes, config)
-      return done(input.kind, cleanedName(input.name), bytes, report)
+      return done(input.kind, cleanedName(input.name), input.bytes, bytes, report)
     }
     case 'md': {
       report('Limpiando metadata', 50)
@@ -1271,7 +1473,7 @@ export async function stripMetadata(
       const content = new TextDecoder().decode(input.bytes)
       const shouldStrip = config.mode === 'deep' || config.blocks.includes('frontmatter')
       const rest = shouldStrip ? parseFrontmatter(content).rest : content
-      return done('md', cleanedName(input.name), new TextEncoder().encode(rest), report)
+      return done('md', cleanedName(input.name), input.bytes, new TextEncoder().encode(rest), report)
     }
     case 'jpg':
     case 'png':
@@ -1295,17 +1497,17 @@ export async function stripMetadata(
           bytes = stripImageBlocks(input.bytes, kind, config.blocks)
         }
       }
-      return done(input.kind, cleanedName(input.name), bytes, report)
+      return done(input.kind, cleanedName(input.name), input.bytes, bytes, report)
     }
     default: {
       if (PLAIN_KINDS.has(input.kind)) {
-        return done(input.kind, cleanedName(input.name), input.bytes.slice(), report)
+        return done(input.kind, cleanedName(input.name), input.bytes, input.bytes.slice(), report)
       }
       const domain = domainOf(input.kind)
       if (domain) {
         report('Limpiando metadata', 50)
         const bytes = await domain.strip(input.bytes, input.kind, config, report)
-        return done(input.kind, cleanedName(input.name), bytes, report)
+        return done(input.kind, cleanedName(input.name), input.bytes, bytes, report)
       }
       throw new Error('La limpieza de metadata para este formato llega en una fase próxima')
     }

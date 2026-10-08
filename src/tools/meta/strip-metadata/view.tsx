@@ -45,6 +45,7 @@ import type {
   MetaEntry,
   MetadataBlock,
   MetadataReport,
+  RegenerationRisk,
   ToolViewProps,
 } from '@/core/types'
 
@@ -115,7 +116,70 @@ function entryMatches(entry: MetaEntry, query: string): boolean {
   )
 }
 
+/**
+ * Avisos de regeneración de ESTE archivo que aplican a un modo. `affects`
+ * decide la tarjeta ('deep' → Profundo; 'light' → Ligero). Vacío = sin ruido.
+ */
+function risksFor(risks: RegenerationRisk[] | undefined, affects: 'deep' | 'light'): RegenerationRisk[] {
+  return (risks ?? []).filter((risk) => risk.affects === affects)
+}
+
+/** Etiquetas de los avisos, recortadas para caber en el botón sin volverse un párrafo. */
+function riskLabelsText(risks: RegenerationRisk[]): string {
+  const labels = risks.map((risk) => risk.label)
+  const shown = labels.slice(0, 3)
+  const joined = shown.join(', ')
+  return labels.length > shown.length ? `${joined} +${labels.length - shown.length}` : joined
+}
+
+/** Severidad más alta presente: manda el aviso de alto riesgo sobre el medio. */
+function highestSeverity(risks: RegenerationRisk[]): 'high' | 'medium' | null {
+  if (risks.length === 0) return null
+  return risks.some((risk) => risk.severity === 'high') ? 'high' : 'medium'
+}
+
 /* ── Subcomponentes (fuera del componente: evita remontajes) ── */
+
+/**
+ * Lista inline de avisos concretos de un modo, DENTRO de su tarjeta. El color
+ * del icono acompaña; la forma (triángulo vs punto) y el texto son el canal que
+ * nunca engaña. Sin avisos no se renderiza nada (ningún recuadro vacío).
+ */
+function RiskList({ risks }: { risks: RegenerationRisk[] }): ReactNode {
+  if (risks.length === 0) return null
+  return (
+    <span className="mt-2 flex flex-col gap-1.5">
+      {risks.map((risk) => {
+        const high = risk.severity === 'high'
+        return (
+          <span key={risk.id} className="flex items-start gap-1.5">
+            {high ? (
+              <AlertTriangle
+                className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+                aria-hidden="true"
+              />
+            ) : (
+              <span
+                className="mt-1.5 size-1.5 shrink-0 rounded-full bg-amber-500/70"
+                aria-hidden="true"
+              />
+            )}
+            <span
+              className={cn(
+                'text-xs leading-relaxed',
+                high
+                  ? 'font-medium text-amber-700 dark:text-amber-300'
+                  : 'text-muted-foreground',
+              )}
+            >
+              {risk.detail}
+            </span>
+          </span>
+        )
+      })}
+    </span>
+  )
+}
 
 /** Cuadro del resumen: número grande + etiqueta. El color acompaña, nunca es el único canal. */
 function SummaryStat({
@@ -500,6 +564,14 @@ export function MetaStripView({ artifact, onSubmit }: ToolViewProps) {
   const useInventory = entryCount > 0
   const canSubmit = mode === 'deep' || deletable.length > 0
 
+  /** Avisos concretos de ESTE archivo, repartidos por la tarjeta del modo que los provoca. */
+  const deepRisks = useMemo(() => risksFor(report?.risks, 'deep'), [report])
+  const lightRisks = useMemo(() => risksFor(report?.risks, 'light'), [report])
+  /** Avisos del modo elegido: los que el botón debe reflejar. */
+  const activeRisks = mode === 'deep' ? deepRisks : lightRisks
+  const activeSeverity = highestSeverity(activeRisks)
+  const activeRiskText = activeRisks.length > 0 ? `Afecta a: ${riskLabelsText(activeRisks)}` : null
+
   function handleSubmit(): void {
     if (!canSubmit) return
     // Ligero borra todos los bloques eliminables; Profundo además regenera.
@@ -655,6 +727,7 @@ export function MetaStripView({ artifact, onSubmit }: ToolViewProps) {
               Elimina solo los bloques marcados, sin re-codificar (excepto las fotos en vertical: si
               guardan orientación EXIF se enderezan automáticamente para que no se giren).
             </span>
+            <RiskList risks={lightRisks} />
           </button>
           <button
             type="button"
@@ -671,12 +744,29 @@ export function MetaStripView({ artifact, onSubmit }: ToolViewProps) {
               un PDF puede dejar de ser seleccionable, las imágenes se vuelven a comprimir y el peso o
               la calidad pueden cambiar.
             </span>
+            <RiskList risks={deepRisks} />
           </button>
         </div>
       </div>
 
-      <Button onClick={handleSubmit} disabled={!canSubmit}>
-        {mode === 'deep' ? 'Regenerar y limpiar todo' : 'Limpiar metadata'}
+      <Button
+        onClick={handleSubmit}
+        disabled={!canSubmit}
+        className={activeRiskText ? 'h-auto whitespace-normal py-2.5' : undefined}
+      >
+        <span className="flex flex-col items-center gap-0.5">
+          <span>{mode === 'deep' ? 'Regenerar y limpiar todo' : 'Limpiar metadata'}</span>
+          {activeRiskText ? (
+            <span className="flex items-center gap-1 text-xs font-normal text-primary-foreground/90">
+              {activeSeverity === 'high' ? (
+                <AlertTriangle className="size-3.5" aria-hidden="true" />
+              ) : (
+                <span className="size-1.5 rounded-full bg-primary-foreground/70" aria-hidden="true" />
+              )}
+              {activeRiskText}
+            </span>
+          ) : null}
+        </span>
       </Button>
     </motion.div>
   )

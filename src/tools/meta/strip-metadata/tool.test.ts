@@ -5,11 +5,15 @@
  * Semántica probada: light = solo bloques seleccionados; passthrough si no se
  * selecciona nada; deep = guardas de navegador (canvas/pdf.js se prueban a mano).
  */
-import { describe, expect, it } from 'vitest'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { describe, expect, it, vi } from 'vitest'
 import { PDFDict, PDFDocument, PDFName, PDFString } from 'pdf-lib'
 import { strToU8, unzipSync, zipSync } from 'fflate'
+import { ResultPanel } from '@/components/workflow/ResultPanel'
 import { scanMetadata, stripMetadata } from './engine'
-import type { EngineInput, FileKind } from '@/core/types'
+import { imagePlusDomain } from './image-plus'
+import type { Artifact, EngineInput, FileKind, VerificationResult } from '@/core/types'
 
 function eng(bytes: Uint8Array, name: string, kind: FileKind, config: Record<string, unknown> = {}): EngineInput {
   return { bytes, name, kind, config }
@@ -68,6 +72,16 @@ async function pdfCustomInfoBytes(): Promise<Uint8Array> {
   return new Uint8Array(await doc.save())
 }
 
+/** PDF con Producer/ModDate explícitos en el Info dict (claves del binario real). */
+async function pdfInfoWithProducerBytes(): Promise<Uint8Array> {
+  const doc = await PDFDocument.create({ updateMetadata: false })
+  doc.setTitle('T')
+  doc.setProducer('ADEI Producer')
+  doc.setModificationDate(new Date('2020-01-02T03:04:05Z'))
+  doc.addPage()
+  return new Uint8Array(await doc.save())
+}
+
 /** PDF con un stream XMP (Metadata) con una propiedad dc:title. */
 async function pdfXmpBytes(): Promise<Uint8Array> {
   const doc = await PDFDocument.create({ updateMetadata: false })
@@ -76,6 +90,24 @@ async function pdfXmpBytes(): Promise<Uint8Array> {
     '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" dc:title="Hola XMP"/></rdf:RDF></x:xmpmeta>'
   const stream = doc.context.stream(xmp, { Type: 'Metadata', Subtype: 'XML' })
   doc.catalog.set(PDFName.of('Metadata'), stream)
+  return new Uint8Array(await doc.save())
+}
+
+/** PDF con un AcroForm real (un campo de texto) → riesgo de formularios. */
+async function pdfFormBytes(): Promise<Uint8Array> {
+  const doc = await PDFDocument.create({ updateMetadata: false })
+  const page = doc.addPage()
+  const form = doc.getForm()
+  form.createTextField('nombre').addToPage(page)
+  return new Uint8Array(await doc.save())
+}
+
+/** PDF con una anotación de enlace en la página → riesgo de enlaces. */
+async function pdfLinkBytes(): Promise<Uint8Array> {
+  const doc = await PDFDocument.create({ updateMetadata: false })
+  const page = doc.addPage()
+  const annot = doc.context.obj({ Type: PDFName.of('Annot'), Subtype: PDFName.of('Link'), Rect: [0, 0, 100, 100] })
+  page.node.set(PDFName.of('Annots'), doc.context.obj([annot]))
   return new Uint8Array(await doc.save())
 }
 
@@ -109,6 +141,15 @@ function docxAppPropsBytes(): Uint8Array {
       '<Properties xmlns="x"><Application>ADEI Test</Application><AppVersion>1.2.3</AppVersion><Company>ACME</Company></Properties>',
     ),
     'word/document.xml': strToU8('<w:document/>'),
+  })
+}
+
+/** DOCX con un proyecto VBA (macros) dentro del paquete OOXML. */
+function docxMacroBytes(): Uint8Array {
+  return zipSync({
+    'docProps/core.xml': strToU8('<cp:coreProperties><dc:creator>Ana</dc:creator></cp:coreProperties>'),
+    'word/document.xml': strToU8('<w:document/>'),
+    'word/vbaProject.bin': new Uint8Array([1, 2, 3, 4]),
   })
 }
 
@@ -235,6 +276,19 @@ function pngTextBytes(): Uint8Array {
   ])
 }
 
+/** Chunk RIFF WebP (fourcc + tamaño LE + datos + pad si es impar). */
+function webpChunk(fourcc: string, data: Uint8Array): Uint8Array {
+  const pad = data.length % 2 === 1 ? Uint8Array.of(0) : new Uint8Array(0)
+  return concat([ascii(fourcc), u32leBytes(data.length), data, pad])
+}
+
+/** WebP animado: VP8X con el flag de animación (0x02) + un chunk ANMF. */
+function webpAnimatedBytes(): Uint8Array {
+  const vp8x = Uint8Array.of(0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+  const body = concat([ascii('WEBP'), webpChunk('VP8X', vp8x), webpChunk('ANMF', ascii('FRAME'))])
+  return concat([ascii('RIFF'), u32leBytes(body.length), body])
+}
+
 describe('scanMetadata', () => {
   it('PDF: detecta Título y Autor como bloque info', async () => {
     const report = await scanMetadata({ bytes: await pdfBytes(), kind: 'pdf' })
@@ -289,15 +343,14 @@ describe('scanMetadata', () => {
     expect(report.blocks).toEqual([])
   })
 
-  it('PDF: una clave personalizada del Info dict no promete borrado (el limpiador no la toca)', async () => {
+  it('PDF: TODAS las claves del Info dict declaran borrado, incluidas las personalizadas', async () => {
     const report = await scanMetadata({ bytes: await pdfCustomInfoBytes(), kind: 'pdf' })
     const custom = report.entries.find((e) => e.key === 'MyCustomKey')
     expect(custom).toBeDefined()
     expect(custom?.where).toBe('info dictionary')
     expect(custom?.value).toBe('valor secreto')
-    // `stripPdfLight` NO borra claves desconocidas: la etiqueta debe ser honesta.
-    expect(custom?.removal).toBe('never')
-    // Las claves que el limpiador sí vacía conservan su declaración de borrado.
+    // `stripPdfLight` elimina TODAS las claves del Info dict: la etiqueta es honesta.
+    expect(custom?.removal).toBe('with-container')
     expect(report.entries.find((e) => e.key === 'Title')?.removal).toBe('with-container')
   })
 
@@ -355,12 +408,52 @@ describe('scanMetadata', () => {
 })
 
 describe('stripMetadata — light lossless', () => {
-  it('PDF: elimina Título/Autor con blocks=["info"]', async () => {
+  it('PDF: elimina TODAS las claves del Info dict con blocks=["info"]', async () => {
     const result = await stripMetadata(eng(await pdfBytes(), 'x.pdf', 'pdf', { mode: 'light', blocks: ['info'] }))
     expect(result.name).toBe('x-limpio.pdf')
     const cleaned = await PDFDocument.load(await bytesOf(result), { updateMetadata: false })
-    expect(cleaned.getTitle()).toBe('')
-    expect(cleaned.getAuthor()).toBe('')
+    const info = cleaned.context.lookup(cleaned.context.trailerInfo.Info)
+    const keys = info instanceof PDFDict ? info.keys().map((k) => k.asString()) : []
+    expect(keys).not.toContain('/Title')
+    expect(keys).not.toContain('/Author')
+    expect(cleaned.getPageCount()).toBe(1)
+  })
+
+  it('PDF: una clave personalizada (/MyCustomKey) desaparece tras ligero y el PDF sigue válido', async () => {
+    const source = await pdfCustomInfoBytes()
+    const before = await PDFDocument.load(source, { updateMetadata: false })
+    const beforeInfo = before.context.lookup(before.context.trailerInfo.Info)
+    expect(beforeInfo instanceof PDFDict && beforeInfo.has(PDFName.of('MyCustomKey'))).toBe(true)
+
+    const result = await stripMetadata(eng(source, 'x.pdf', 'pdf', { mode: 'light', blocks: ['info'] }))
+    const out = await bytesOf(result)
+    const cleaned = await PDFDocument.load(out, { updateMetadata: false })
+    const info = cleaned.context.lookup(cleaned.context.trailerInfo.Info)
+    const keys = info instanceof PDFDict ? info.keys().map((k) => k.asString()) : []
+    expect(keys).not.toContain('/MyCustomKey')
+    // Sigue siendo un PDF válido y con su página.
+    expect(cleaned.getPageCount()).toBe(1)
+    // El valor secreto de la clave personalizada ya no está en el binario.
+    expect(new TextDecoder().decode(out)).not.toContain('valor secreto')
+  })
+
+  it('PDF: light con blocks=["info"] elimina Producer y ModDate del Info dict', async () => {
+    const source = await pdfInfoWithProducerBytes()
+    const before = await PDFDocument.load(source, { updateMetadata: false })
+    const beforeInfo = before.context.lookup(before.context.trailerInfo.Info)
+    const beforeKeys = beforeInfo instanceof PDFDict ? beforeInfo.keys().map((k) => k.asString()) : []
+    expect(beforeKeys).toContain('/Producer')
+    expect(beforeKeys).toContain('/ModDate')
+
+    const out = await bytesOf(
+      await stripMetadata(eng(source, 'x.pdf', 'pdf', { mode: 'light', blocks: ['info'] })),
+    )
+    const cleaned = await PDFDocument.load(out, { updateMetadata: false })
+    const info = cleaned.context.lookup(cleaned.context.trailerInfo.Info)
+    const keys = info instanceof PDFDict ? info.keys().map((k) => k.asString()) : []
+    expect(keys).not.toContain('/Producer')
+    expect(keys).not.toContain('/ModDate')
+    expect(cleaned.getPageCount()).toBe(1)
   })
 
   it('PDF: sin bloques seleccionados → passthrough intacto', async () => {
@@ -516,5 +609,160 @@ describe('scanMetadata — inventario genérico (entries)', () => {
   it('MD: las claves del frontmatter aparecen como entradas', async () => {
     const report = await scanMetadata({ bytes: mdBytes(), kind: 'md' })
     expect(report.entries.some((e) => e.key === 'title')).toBe(true)
+  })
+})
+
+describe('scanMetadata — avisos de regeneración (risks)', () => {
+  it('PDF plano: no produce ningún aviso', async () => {
+    const report = await scanMetadata({ bytes: await pdfBytes(), kind: 'pdf' })
+    expect(report.risks ?? []).toHaveLength(0)
+  })
+
+  it('PDF con AcroForm: avisa de formularios (profundo)', async () => {
+    const report = await scanMetadata({ bytes: await pdfFormBytes(), kind: 'pdf' })
+    const risk = report.risks?.find((r) => r.id === 'pdf-forms')
+    expect(risk).toBeDefined()
+    expect(risk?.affects).toBe('deep')
+    expect(risk?.severity).toBe('high')
+  })
+
+  it('PDF con anotación de enlace: avisa de enlaces (profundo)', async () => {
+    const report = await scanMetadata({ bytes: await pdfLinkBytes(), kind: 'pdf' })
+    const risk = report.risks?.find((r) => r.id === 'pdf-links')
+    expect(risk).toBeDefined()
+    expect(risk?.affects).toBe('deep')
+  })
+
+  it('OOXML con vbaProject.bin: avisa de macros (profundo)', async () => {
+    const report = await scanMetadata({ bytes: docxMacroBytes(), kind: 'docx' })
+    const risk = report.risks?.find((r) => r.id === 'office-macros')
+    expect(risk).toBeDefined()
+    expect(risk?.severity).toBe('high')
+    expect(risk?.affects).toBe('deep')
+  })
+
+  it('DOCX sin macros: no produce aviso de macros', async () => {
+    const report = await scanMetadata({ bytes: docxBytes(), kind: 'docx' })
+    expect(report.risks?.some((r) => r.id === 'office-macros') ?? false).toBe(false)
+  })
+
+  it('WebP animado: avisa de que profundo deja solo el primer frame', async () => {
+    const report = await scanMetadata({ bytes: webpAnimatedBytes(), kind: 'webp' })
+    const risk = report.risks?.find((r) => r.id === 'webp-animated')
+    expect(risk).toBeDefined()
+    expect(risk?.affects).toBe('deep')
+  })
+
+  it('Imagen con Orientation > 1: avisa de que ligero la re-codifica', async () => {
+    const report = await scanMetadata({ bytes: jpgOrientationBytes(), kind: 'jpg' })
+    const risk = report.risks?.find((r) => r.id === 'image-orientation')
+    expect(risk).toBeDefined()
+    expect(risk?.affects).toBe('light')
+  })
+})
+
+/** GIF con un comentario (bloque 'text'): sirve para forzar el re-escaneo. */
+function gifCommentBytes(): Uint8Array {
+  return concat([
+    ascii('GIF89a'),
+    Uint8Array.of(0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00),
+    Uint8Array.of(0x21, 0xfe, 0x03),
+    ascii('HOLA'),
+    Uint8Array.of(0x00),
+    Uint8Array.of(0x3b),
+  ])
+}
+
+describe('stripMetadata — verificación posterior (verify-after-clean)', () => {
+  it('un archivo que queda limpio reporta status "clean"', async () => {
+    const result = await stripMetadata(
+      eng(await pdfBytes(), 'x.pdf', 'pdf', { mode: 'light', blocks: ['info'] }),
+    )
+    expect(result.verification?.status).toBe('clean')
+  })
+
+  it('cuando queda metadata eliminable reporta "remaining" con recuento y muestra', async () => {
+    // Solo se limpia el Info dict: el paquete XMP sigue presente (no seleccionado).
+    const result = await stripMetadata(
+      eng(await pdfXmpBytes(), 'x.pdf', 'pdf', { mode: 'light', blocks: ['info'] }),
+    )
+    expect(result.verification?.status).toBe('remaining')
+    expect(result.verification?.remaining).toBeGreaterThan(0)
+    expect(result.verification?.sample?.length).toBeGreaterThan(0)
+  })
+
+  it('si el re-escaneo falla informa "unverifiable" y la limpieza no falla', async () => {
+    const spy = vi
+      .spyOn(imagePlusDomain, 'scan')
+      .mockRejectedValue(new Error('fallo de re-escaneo'))
+    try {
+      const result = await stripMetadata(
+        eng(gifCommentBytes(), 'foto.gif', 'gif', { mode: 'light', blocks: ['text'] }),
+      )
+      expect(result.verification?.status).toBe('unverifiable')
+      // La operación termina y entrega un archivo descargable.
+      expect(result.name).toBe('foto-limpio.gif')
+      expect(result.blob.size).toBeGreaterThan(0)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('si ni el original ni el resultado son interpretables informa "unverifiable" (nunca "clean")', async () => {
+    // Ambos escaneos devuelven EMPTY_REPORT ("no parseable"): no se puede afirmar limpieza.
+    const result = await stripMetadata(
+      eng(new TextEncoder().encode('NOT-A-FLAC'), 'x.flac', 'flac', { mode: 'light', blocks: ['vorbis'] }),
+    )
+    expect(result.verification?.status).toBe('unverifiable')
+  })
+})
+
+describe('<ResultPanel /> — aviso de verificación', () => {
+  function renderPanel(verification?: VerificationResult): string {
+    const artifact: Artifact = {
+      id: 'r1',
+      name: 'x-limpio.pdf',
+      kind: 'pdf',
+      size: 1024,
+      source: 'file',
+      blob: new Blob(['limpio']),
+    }
+    return renderToStaticMarkup(
+      createElement(ResultPanel, {
+        artifact,
+        onDownload: () => {},
+        onRestart: () => {},
+        verification,
+      }),
+    )
+  }
+
+  it('con status "clean" no muestra ningún aviso', () => {
+    const html = renderPanel({ status: 'clean' })
+    expect(html).not.toMatch(/Quedan .* sin eliminar/i)
+    expect(html).not.toMatch(/no se pudo verificar/i)
+    expect(html).not.toContain('role="alert"')
+  })
+
+  it('sin verificación no muestra ningún aviso', () => {
+    const html = renderPanel(undefined)
+    expect(html).not.toMatch(/Quedan .* sin eliminar/i)
+    expect(html).not.toMatch(/no se pudo verificar/i)
+  })
+
+  it('con restos muestra el recuento y la muestra, sin bloquear la descarga', () => {
+    const html = renderPanel({
+      status: 'remaining',
+      remaining: 3,
+      sample: ['Título', 'Autor', 'dc:title'],
+    })
+    expect(html).toMatch(/Quedan 3 datos sin eliminar/)
+    expect(html).toMatch(/Título, Autor, dc:title/)
+    expect(html).toMatch(/Descargar/)
+  })
+
+  it('con "unverifiable" muestra una nota suave', () => {
+    const html = renderPanel({ status: 'unverifiable' })
+    expect(html).toMatch(/no se pudo verificar/i)
   })
 })

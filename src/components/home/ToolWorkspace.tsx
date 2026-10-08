@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { ArrowLeft, Construction, RefreshCw } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -17,7 +17,7 @@ import { saveResult } from '@/core/ports'
 import { useHistory } from '@/core/stores/history'
 import { useWorkflow } from '@/core/stores/workflow'
 import { getToolView, hasProcessor, runTool } from '@/tools/registry'
-import type { Action, ActionConfig, Artifact, FileKind } from '@/core/types'
+import type { Action, ActionConfig, Artifact, FileKind, VerificationResult } from '@/core/types'
 
 interface ToolWorkspaceProps {
   action: Action
@@ -137,14 +137,19 @@ export function ToolWorkspace({ action, artifact, onBack }: ToolWorkspaceProps) 
 
   const recordRun = useHistory((state) => state.record)
 
+  // Verificación posterior a la limpieza devuelta por el motor (solo meta.strip).
+  const [verification, setVerification] = useState<VerificationResult | undefined>(undefined)
+
   // Al montar la tool (padre usa key={action.id}): workflow limpio en 'config'.
   useEffect(() => {
     resetWorkflow()
     setStep('config')
+    setVerification(undefined)
   }, [resetWorkflow, setStep])
 
   function handleBack() {
     resetWorkflow()
+    setVerification(undefined)
     onBack()
   }
 
@@ -153,6 +158,7 @@ export function ToolWorkspace({ action, artifact, onBack }: ToolWorkspaceProps) 
     setProgress({ phase: 'Preparando', percent: 0 })
     try {
       const out = await runTool(action.id, { artifact, config, files }, { onProgress: setProgress })
+      setVerification(out.verification)
       setResult({
         id: crypto.randomUUID(),
         name: out.name,
@@ -171,11 +177,13 @@ export function ToolWorkspace({ action, artifact, onBack }: ToolWorkspaceProps) 
 
   function handleRetry() {
     resetWorkflow()
+    setVerification(undefined)
     setStep('config')
   }
 
   function handleRestart() {
     resetWorkflow()
+    setVerification(undefined)
     setStep('config')
   }
 
@@ -323,7 +331,12 @@ export function ToolWorkspace({ action, artifact, onBack }: ToolWorkspaceProps) 
             ) : null}
 
             {step === 'done' && result ? (
-              <ResultPanel artifact={result} onDownload={handleDownload} onRestart={handleRestart} />
+              <ResultPanel
+                artifact={result}
+                verification={verification}
+                onDownload={handleDownload}
+                onRestart={handleRestart}
+              />
             ) : null}
 
             {step === 'error' ? (

@@ -175,6 +175,187 @@ function heicFixture(): Uint8Array {
   ])
 }
 
+/** Entero de 2 bytes big-endian. */
+function u16be(n: number): Uint8Array {
+  return Uint8Array.from([(n >> 8) & 0xff, n & 0xff])
+}
+
+/** Entero → `size` bytes big-endian (2 o 4). */
+function writeSizedBE(n: number, size: number): Uint8Array {
+  return size === 2 ? u16be(n) : u32be(n)
+}
+
+/**
+ * HEIC con un item EXIF real dentro de `meta`: `iinf` declara el item `Exif`
+ * (id 1) e `iloc` apunta a su payload en `mdat`. Devuelve también la posición y
+ * longitud del payload para comprobar el borrado. Con `offsetSize` distinto de
+ * 4 se construye una variante NO soportada (para el test de passthrough).
+ */
+function heicExifFixture(offsetSize = 4): { bytes: Uint8Array; exifOffset: number; exifLength: number } {
+  const exifPayload = ascii('EXIFPAYLOADDATA')
+  const itemId = 1
+  const infe = isoBox(
+    'infe',
+    concat([
+      Uint8Array.of(2, 0, 0, 0), // versión 2 (item_ID de 16 bits + item_type)
+      u16be(itemId),
+      u16be(0), // item_protection_index
+      ascii('Exif'),
+      Uint8Array.of(0), // item_name vacío
+    ]),
+  )
+  const iinf = isoBox('iinf', concat([Uint8Array.of(0, 0, 0, 0), u16be(1), infe]))
+  const ilocFor = (offset: number): Uint8Array =>
+    isoBox(
+      'iloc',
+      concat([
+        Uint8Array.of(0, 0, 0, 0), // versión 0
+        Uint8Array.of((offsetSize << 4) | 4), // offset_size | length_size
+        Uint8Array.of(0x00), // base_offset_size = 0
+        u16be(1), // item_count
+        u16be(itemId),
+        u16be(0), // data_reference_index
+        u16be(1), // extent_count
+        writeSizedBE(offset, offsetSize),
+        u32be(exifPayload.length),
+      ]),
+    )
+  const ftyp = isoBox('ftyp', ascii('heic'))
+  // El tamaño de `meta` no depende del VALOR del offset (solo de su ancho): se
+  // calcula una vez y luego se rellena el offset absoluto real del payload.
+  const metaSize = 8 + 4 + iinf.length + ilocFor(0).length
+  const exifOffset = ftyp.length + metaSize + 8 // 8 = cabecera de `mdat`
+  const meta = isoBox('meta', concat([Uint8Array.of(0, 0, 0, 0), iinf, ilocFor(exifOffset)]))
+  const mdat = isoBox('mdat', exifPayload)
+  return { bytes: concat([ftyp, meta, mdat]), exifOffset, exifLength: exifPayload.length }
+}
+
+/**
+ * HEIC de juguete con un item `Exif` dentro de `meta` y su payload en `mdat`
+ * (offsets ABSOLUTOS, `construction_method` 0). Configurable para cubrir `infe`
+ * v2/v3, `iinf` v0/v1, `base_offset_size`/`base_offset` y varios extents.
+ * Devuelve los rangos EXIF absolutos esperados para comprobar el borrado.
+ */
+function heicAbsExifFixture(
+  opts: {
+    infeVersion?: 2 | 3
+    iinfVersion?: 0 | 1
+    baseOffsetSize?: 0 | 4 | 8
+    baseOffset?: number
+    offsetSize?: 4 | 8
+    lengthSize?: 4 | 8
+    extents?: Array<{ offset: number; length: number }>
+  } = {},
+): { bytes: Uint8Array; ranges: Array<{ start: number; length: number }> } {
+  const infeVersion = opts.infeVersion ?? 2
+  const iinfVersion = opts.iinfVersion ?? 0
+  const baseOffsetSize = opts.baseOffsetSize ?? 0
+  const baseOffset = opts.baseOffset ?? 0
+  const offsetSize = opts.offsetSize ?? 4
+  const lengthSize = opts.lengthSize ?? 4
+  const relExtents = opts.extents ?? [{ offset: 0, length: 8 }]
+  const itemId = 1
+
+  const sizedBE = (n: number, size: number): Uint8Array => {
+    if (size === 0) return new Uint8Array(0)
+    if (size === 4) return u32be(n)
+    return concat([u32be(Math.floor(n / 0x100000000)), u32be(n >>> 0)])
+  }
+
+  const infe = isoBox(
+    'infe',
+    concat([
+      Uint8Array.of(infeVersion, 0, 0, 0), // item_ID de 32 bits si versión ≥ 3
+      infeVersion >= 3 ? u32be(itemId) : u16be(itemId),
+      u16be(0), // item_protection_index
+      ascii('Exif'),
+      Uint8Array.of(0), // item_name vacío
+    ]),
+  )
+  const iinf = isoBox(
+    'iinf',
+    concat([
+      Uint8Array.of(iinfVersion, 0, 0, 0), // count de 32 bits si versión ≥ 1
+      iinfVersion === 0 ? u16be(1) : u32be(1),
+      infe,
+    ]),
+  )
+  const ftyp = isoBox('ftyp', ascii('heic'))
+
+  // Cada extent ocupa un bloque de 16 bytes lleno de 0x58 ('X'): así quedan
+  // bytes NO cero fuera de las regiones borradas (prueba de borrado parcial).
+  const mdat = isoBox('mdat', concat(relExtents.map(() => new Uint8Array(16).fill(0x58))))
+
+  const ilocBody = (written: number[]): Uint8Array =>
+    concat([
+      Uint8Array.of(0, 0, 0, 0), // versión 0 → construction_method implícito = 0
+      Uint8Array.of((offsetSize << 4) | lengthSize),
+      Uint8Array.of(baseOffsetSize << 4), // index_size = 0
+      u16be(1), // item_count
+      u16be(itemId),
+      u16be(0), // data_reference_index
+      sizedBE(baseOffset, baseOffsetSize),
+      u16be(relExtents.length),
+      ...relExtents.flatMap((e, i) => [sizedBE(written[i]!, offsetSize), sizedBE(e.length, lengthSize)]),
+    ])
+
+  // El largo de `iloc` no depende de los VALORES de offset: se calcula con ceros
+  // y después se reescribe con los offsets absolutos reales.
+  const ilocLen = isoBox('iloc', ilocBody(relExtents.map(() => 0))).length
+  const metaLen = 8 + 4 + iinf.length + ilocLen
+  const mdatDataStart = ftyp.length + metaLen + 8
+  const absolute = relExtents.map((e) => mdatDataStart + e.offset)
+  // En method 0 el parser resuelve `base_offset + offset`: se escribe el offset
+  // ya descontado el base para que el rango resuelto sea el absoluto.
+  const written = absolute.map((a) => a - baseOffset)
+  const iloc = isoBox('iloc', ilocBody(written))
+  const meta = isoBox('meta', concat([Uint8Array.of(0, 0, 0, 0), iinf, iloc]))
+  const ranges = relExtents.map((e, i) => ({ start: absolute[i]!, length: e.length }))
+  return { bytes: concat([ftyp, meta, mdat]), ranges }
+}
+
+/**
+ * HEIC de juguete con el item `Exif` almacenado en el `idat` de `meta`
+ * (`construction_method` 1): el offset de `iloc` es relativo al payload de
+ * `idat`. Con `constructionMethod` distinto de 1 se construye una variante NO
+ * soportada (p. ej. 2 = item offset).
+ */
+function heicIdatExifFixture(constructionMethod = 1): {
+  bytes: Uint8Array
+  exifOffset: number
+  exifLength: number
+} {
+  const exifPayload = ascii('IDATPAYLOAD')
+  const itemId = 1
+  const infe = isoBox(
+    'infe',
+    concat([Uint8Array.of(2, 0, 0, 0), u16be(itemId), u16be(0), ascii('Exif'), Uint8Array.of(0)]),
+  )
+  const iinf = isoBox('iinf', concat([Uint8Array.of(0, 0, 0, 0), u16be(1), infe]))
+  const iloc = isoBox(
+    'iloc',
+    concat([
+      Uint8Array.of(1, 0, 0, 0), // versión 1 → aparece construction_method
+      Uint8Array.of((4 << 4) | 4), // offset_size 4, length_size 4
+      Uint8Array.of(0x00), // base_offset_size 0, index_size 0
+      u16be(1), // item_count
+      u16be(itemId),
+      u16be(constructionMethod),
+      u16be(0), // data_reference_index
+      u16be(1), // extent_count
+      u32be(0), // extent_offset (relativo al payload de idat)
+      u32be(exifPayload.length),
+    ]),
+  )
+  const idat = isoBox('idat', exifPayload)
+  const ftyp = isoBox('ftyp', ascii('heic'))
+  const meta = isoBox('meta', concat([Uint8Array.of(0, 0, 0, 0), iinf, iloc, idat]))
+  // idat empieza tras ftyp + 12 (cabecera+versión de meta) + iinf + iloc; su
+  // payload, 8 bytes más allá.
+  const exifOffset = ftyp.length + 20 + iinf.length + iloc.length
+  return { bytes: concat([ftyp, meta]), exifOffset, exifLength: exifPayload.length }
+}
+
 /** Ejecuta el strip del dominio como helper síncrono. */
 function stripSync(
   bytes: Uint8Array,
@@ -436,6 +617,85 @@ describe('heic', () => {
     expect(indexOf(out, ascii('mdat'))).toBe(indexOf(src, ascii('mdat')))
   })
 
+  it('light blocks=["exif"]: pone a cero el payload EXIF dentro de meta y conserva el tamaño', async () => {
+    const { bytes: src, exifOffset, exifLength } = heicExifFixture()
+    const out = await stripSync(src, 'heic', { mode: 'light', blocks: ['exif'] })
+    // Tamaño intacto: HEIC ubica sus items por offsets absolutos (`iloc`).
+    expect(out.length).toBe(src.length)
+    // El payload EXIF queda íntegramente a cero.
+    expect(out.slice(exifOffset, exifOffset + exifLength).every((b) => b === 0)).toBe(true)
+    // La declaración del item y el layout se conservan; el contenido no.
+    expect(textOf(out)).toContain('Exif')
+    expect(textOf(out)).not.toContain('EXIFPAYLOADDATA')
+  })
+
+  it('deep: también pone a cero el EXIF de dentro de meta', async () => {
+    const { bytes: src, exifOffset, exifLength } = heicExifFixture()
+    const out = await stripSync(src, 'heic', { mode: 'deep', blocks: [] })
+    expect(out.length).toBe(src.length)
+    expect(out.slice(exifOffset, exifOffset + exifLength).every((b) => b === 0)).toBe(true)
+  })
+
+  it('iloc con ancho no soportado: passthrough byte a byte, sin lanzar', async () => {
+    const { bytes: src } = heicExifFixture(2)
+    const out = await stripSync(src, 'heic', { mode: 'light', blocks: ['exif'] })
+    expect(sameBytes(out, src)).toBe(true)
+  })
+
+  it('infe v3 + iinf v1: localiza el item Exif (item_ID/count de 32 bits) y lo borra', async () => {
+    const { bytes: src, ranges } = heicAbsExifFixture({ infeVersion: 3, iinfVersion: 1 })
+    const out = await stripSync(src, 'heic', { mode: 'light', blocks: ['exif'] })
+    expect(out.length).toBe(src.length)
+    for (const range of ranges) {
+      expect(out.slice(range.start, range.start + range.length).every((b) => b === 0)).toBe(true)
+    }
+    // Fuera del extent los bytes siguen intactos (0x58).
+    expect(out[ranges[0]!.start + ranges[0]!.length]).toBe(0x58)
+  })
+
+  it('iloc con base_offset_size != 0: resuelve base_offset + offset y borra', async () => {
+    const { bytes: src, ranges } = heicAbsExifFixture({ baseOffsetSize: 4, baseOffset: 10 })
+    const out = await stripSync(src, 'heic', { mode: 'light', blocks: ['exif'] })
+    expect(out.length).toBe(src.length)
+    for (const range of ranges) {
+      expect(out.slice(range.start, range.start + range.length).every((b) => b === 0)).toBe(true)
+    }
+  })
+
+  it('iloc con varios extents del mismo item: los borra TODOS', async () => {
+    const { bytes: src, ranges } = heicAbsExifFixture({
+      extents: [
+        { offset: 0, length: 8 },
+        { offset: 16, length: 8 },
+      ],
+    })
+    expect(ranges).toHaveLength(2)
+    const out = await stripSync(src, 'heic', { mode: 'light', blocks: ['exif'] })
+    expect(out.length).toBe(src.length)
+    for (const range of ranges) {
+      expect(out.slice(range.start, range.start + range.length).every((b) => b === 0)).toBe(true)
+    }
+    // Justo tras cada extent siguen los 0x58 (borrado acotado, no en bloque).
+    expect(out[ranges[0]!.start + ranges[0]!.length]).toBe(0x58)
+    expect(out[ranges[1]!.start + ranges[1]!.length]).toBe(0x58)
+  })
+
+  it('construction_method 1 (idat): borra el extent relativo al idat sin cambiar el tamaño', async () => {
+    const { bytes: src, exifOffset, exifLength } = heicIdatExifFixture(1)
+    const out = await stripSync(src, 'heic', { mode: 'light', blocks: ['exif'] })
+    expect(out.length).toBe(src.length)
+    expect(out.slice(exifOffset, exifOffset + exifLength).every((b) => b === 0)).toBe(true)
+    expect(textOf(out)).not.toContain('IDATPAYLOAD')
+    // El contenedor y la caja `idat` siguen en su sitio.
+    expect(textOf(out)).toContain('idat')
+  })
+
+  it('construction_method 2 (item offset) no resoluble: passthrough byte a byte, sin lanzar', async () => {
+    const { bytes: src } = heicIdatExifFixture(2)
+    const out = await stripSync(src, 'heic', { mode: 'light', blocks: ['exif'] })
+    expect(sameBytes(out, src)).toBe(true)
+  })
+
   it('scan nunca lanza con bytes basura', async () => {
     const junk = Uint8Array.from([0x00, 0x01, 0xfe, 0xff, 0x44, 0x00, 0x11, 0xaa])
     const report = await imagePlusDomain.scan(junk)
@@ -463,7 +723,7 @@ describe('heic', () => {
     expect(format?.fields.find((f) => f.name === 'Marcas compatibles')?.value).toBe('mif1, heic, avif')
   })
 
-  it('scan: el EXIF dentro de `meta` no promete borrado (never) y el namespace xmp por defecto se enumera', async () => {
+  it('scan: el EXIF dentro de `meta` declara borrado y el namespace xmp por defecto se enumera', async () => {
     // exifr real no puede leer el HEIC de juguete: se simula su salida estructurada.
     exifrMock.parse.mockImplementation(async (_bytes: unknown, options?: unknown) => {
       if (options) return { ifd0: { Make: 'NIKON', ImageWidth: 4000 }, xmp: { CreatorTool: 'MiEditor' } }
@@ -473,15 +733,51 @@ describe('heic', () => {
     const make = report.entries.find((e) => e.key === 'Make')
     expect(make).toBeDefined()
     expect(make?.where).toBe('EXIF IFD0')
-    // `stripHeic` NO elimina el EXIF dentro de `meta`: la etiqueta debe ser honesta.
-    expect(make?.removal).toBe('never')
+    // `stripHeic` pone a cero el item Exif dentro de `meta`: la etiqueta es honesta.
+    expect(make?.removal).toBe('with-container')
     const width = report.entries.find((e) => e.key === 'ImageWidth')
-    expect(width?.removal).toBe('never')
+    expect(width?.removal).toBe('with-container')
     // El namespace XMP por defecto (`xmp:`) también se enumera (antes se descartaba).
+    // El borrado del item `mime`/XMP queda para una fase próxima: se declara conservado.
     const creatorTool = report.entries.find((e) => e.key === 'xmp:CreatorTool')
     expect(creatorTool).toBeDefined()
     expect(creatorTool?.where).toBe('XMP')
     expect(creatorTool?.removal).toBe('never')
+  })
+
+  it('scan: si el iloc no es resoluble, el EXIF se declara conservado (nunca "Se elimina")', async () => {
+    exifrMock.parse.mockImplementation(async (_bytes: unknown, options?: unknown) => {
+      if (options) return { ifd0: { Make: 'NIKON' }, xmp: { CreatorTool: 'MiEditor' } }
+      return { Make: 'NIKON' }
+    })
+    // construction_method 2 no es resoluble → `stripHeic` sería passthrough.
+    const { bytes: src } = heicIdatExifFixture(2)
+    const report = await imagePlusDomain.scan(src)
+    const make = report.entries.find((e) => e.key === 'Make')
+    expect(make).toBeDefined()
+    expect(make?.removal).toBe('never')
+    // El XMP sigue siendo 'never' (intencionalmente no se borra).
+    expect(report.entries.find((e) => e.key === 'xmp:CreatorTool')?.removal).toBe('never')
+  })
+
+  it('scan: con construction_method 1 (idat) resoluble, el EXIF sí declara borrado', async () => {
+    exifrMock.parse.mockImplementation(async (_bytes: unknown, options?: unknown) => {
+      if (options) return { ifd0: { Make: 'NIKON' } }
+      return { Make: 'NIKON' }
+    })
+    const { bytes: src } = heicIdatExifFixture(1)
+    const report = await imagePlusDomain.scan(src)
+    expect(report.entries.find((e) => e.key === 'Make')?.removal).toBe('with-container')
+  })
+
+  it('scan: con iloc de offsets absolutos resoluble, el EXIF declara borrado', async () => {
+    exifrMock.parse.mockImplementation(async (_bytes: unknown, options?: unknown) => {
+      if (options) return { ifd0: { Make: 'NIKON' } }
+      return { Make: 'NIKON' }
+    })
+    const { bytes: src } = heicAbsExifFixture()
+    const report = await imagePlusDomain.scan(src)
+    expect(report.entries.find((e) => e.key === 'Make')?.removal).toBe('with-container')
   })
 })
 
@@ -503,5 +799,20 @@ describe('integración con el engine', () => {
     expect(txt).not.toContain('HOLA MUNDO')
     expect(txt).toContain('XMP DataXMP')
     expect(out[out.length - 1]).toBe(0x3b)
+  })
+
+  it('stripMetadata(heic, light exif) → EXIF a cero sin cambiar el tamaño', async () => {
+    const { bytes: src, exifOffset, exifLength } = heicExifFixture()
+    const result = await stripMetadata({
+      bytes: src,
+      name: 'foto.heic',
+      kind: 'heic',
+      config: { mode: 'light', blocks: ['exif'] },
+    })
+    expect(result.kind).toBe('heic')
+    expect(result.name).toBe('foto-limpio.heic')
+    const out = new Uint8Array(await result.blob.arrayBuffer())
+    expect(out.length).toBe(src.length)
+    expect(out.slice(exifOffset, exifOffset + exifLength).every((b) => b === 0)).toBe(true)
   })
 })

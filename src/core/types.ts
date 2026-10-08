@@ -82,6 +82,21 @@ export interface ProcessResult {
   kind: FileKind
   blob: Blob
   size: number
+  /** Verificación posterior a la limpieza (solo `meta.strip` la rellena). */
+  verification?: VerificationResult
+}
+
+/**
+ * Resultado de comprobar que el archivo limpio no conserva metadata eliminable.
+ * Se calcula re-escaneando los bytes de salida (no bloquea la descarga).
+ */
+export interface VerificationResult {
+  /** 'clean' = no quedó nada eliminable · 'remaining' = quedan restos · 'unverifiable' = no se pudo comprobar */
+  status: 'clean' | 'remaining' | 'unverifiable'
+  /** Nº de entradas eliminables que siguen presentes (solo con status 'remaining') */
+  remaining?: number
+  /** Muestra corta de etiquetas/claves de esos restos */
+  sample?: string[]
 }
 
 /** Archivo extra que acompaña a una tool multiarchivo (p. ej. Unir PDFs). */
@@ -182,6 +197,23 @@ export interface MetaEntry {
   removal: MetaRemoval
 }
 
+/**
+ * Aviso de pérdida CONCRETA al regenerar el archivo en el modo elegido.
+ * `affects` indica en qué modo se produce la pérdida ('deep' re-genera/rasteriza,
+ * 'light' re-codifica). El visor lo muestra inline en la tarjeta del modo.
+ */
+export type RegenerationRisk = {
+  /** Identificador estable (p. ej. 'pdf-forms'). */
+  id: string
+  /** Etiqueta corta para el usuario (español). */
+  label: string
+  /** Qué se pierde exactamente (español). */
+  detail: string
+  severity: 'high' | 'medium'
+  /** Modo en el que se produce la pérdida. */
+  affects: 'deep' | 'light'
+}
+
 /** Resultado del scan de metadata (el visor usa `entries`; `blocks`/`fields` son el legado). */
 export interface MetadataReport {
   fields: MetadataField[]
@@ -189,6 +221,11 @@ export interface MetadataReport {
   blocks: MetadataBlock[]
   /** Inventario exhaustivo: TODO lo que el archivo contiene (incluido lo desconocido). */
   entries: MetaEntry[]
+  /**
+   * Avisos de pérdida al limpiar ESTE archivo (opcional: los productores que no
+   * los detectan siguen siendo válidos). Vacío o ausente = sin avisos.
+   */
+  risks?: RegenerationRisk[]
 }
 
 /**

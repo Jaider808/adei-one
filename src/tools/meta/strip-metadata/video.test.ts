@@ -544,15 +544,15 @@ describe('videoDomain — mkv', () => {
     expect(txt).toContain('Mi video') // Title conservado
   })
 
-  it('deep quita Tags, Title, Attachments y Void; conserva Info y Cluster', async () => {
+  it('deep quita Tags, Title, Attachments, Void y timestamps; conserva Info y Cluster', async () => {
     const out = await stripVideo(MKV, 'mkv', { mode: 'deep', blocks: [] })
     const txt = textOf(out)
     expect(txt).not.toContain('TAGDATA')
     expect(txt).not.toContain('Mi video')
     expect(txt).not.toContain('caratula.jpg')
     expect(txt).not.toContain('BASURA') // Void eliminado
-    expect(txt).toContain('ffmpeg')
-    expect(txt).toContain('Lavf60')
+    expect(txt).not.toContain('ffmpeg') // MuxingApp sustituido por Void en deep
+    expect(txt).not.toContain('Lavf60') // WritingApp sustituido por Void en deep
     expect(txt).toContain('MARCADOR') // Cluster intacto
     expect(containsBytes(out, Uint8Array.of(0x73, 0xa4))).toBe(true) // SegmentUID conservado
     expect(containsBytes(out, Uint8Array.of(0x12, 0x54, 0xc3, 0x67))).toBe(false) // Tags fuera
@@ -891,7 +891,7 @@ describe('videoDomain — mkv layout (filler Void)', () => {
     expect(indexOfBytes(out, ascii('MARCADOR'))).toBe(indexOfBytes(src, ascii('MARCADOR')))
     expect(indexOfBytes(out, ascii('caratula.jpg'))).toBe(-1)
     expect(indexOfBytes(out, ascii('BASURA'))).toBe(-1)
-    expect(indexOfBytes(out, ascii('ffmpeg'))).toBe(indexOfBytes(src, ascii('ffmpeg')))
+    expect(indexOfBytes(out, ascii('ffmpeg'))).toBe(-1) // MuxingApp sustituido por Void en deep
   })
 })
 
@@ -913,7 +913,9 @@ describe('videoDomain — inventario mp4 (entries)', () => {
     expect(report.entries.some((e) => e.where.includes('tkhd') && e.key === 'creation_time')).toBe(true)
     expect(report.entries.some((e) => e.key === 'modification_time')).toBe(true)
     const mvhd = report.entries.find((e) => e.where.includes('mvhd') && e.key === 'creation_time')
-    expect(mvhd?.removal).toBe('never')
+    // Antes decía 'never' (fuga: el inventario prometía conservar lo que el
+    // limpiador ya puede poner a cero con el bloque 'timestamps').
+    expect(mvhd?.removal).toBe('individual')
   })
 
   it('clasifica las cajas uuid (XMP) por su identificador', async () => {
@@ -981,6 +983,110 @@ describe('videoDomain — inventario avi (entries)', () => {
   })
 })
 
+/* ════════════ Fuga IDIT de AVI (fecha de digitalización) ════════════ */
+
+/** avi con IDIT de NIVEL SUPERIOR (fecha de digitalización) junto a LIST INFO y JUNK. */
+const AVI_IDIT = concat([
+  ascii('RIFF'),
+  u32le(0),
+  ascii('AVI '),
+  aviList('hdrl', [aviChunk('avih', mainAviHeader()), aviVideoStream()]),
+  aviList('INFO', [aviChunk('INAM', ascii('Mi peli'))]),
+  aviChunk('IDIT', ascii('2024-01-01')),
+  aviChunk('JUNK', ascii('BASURA')),
+  aviList('movi', [aviChunk('00dc', ascii('FRAME1'))]),
+])
+
+/** avi cuyo IDIT vive DENTRO del LIST INFO (se borra con su contenedor). */
+const AVI_IDIT_IN_INFO = concat([
+  ascii('RIFF'),
+  u32le(0),
+  ascii('AVI '),
+  aviList('hdrl', [aviChunk('avih', mainAviHeader()), aviVideoStream()]),
+  aviList('INFO', [aviChunk('INAM', ascii('Mi peli')), aviChunk('IDIT', ascii('2024-01-01'))]),
+  aviList('movi', [aviChunk('00dc', ascii('FRAME1'))]),
+])
+
+describe('videoDomain — fuga IDIT de AVI', () => {
+  it('scan reporta el IDIT de nivel superior en el bloque info (sin contradecir el inventario)', async () => {
+    const report = await videoDomain.scan(AVI_IDIT)
+    const info = report.blocks.find((b) => b.id === 'info')
+    expect(info?.fields.some((f) => f.name === 'Fecha de digitalización' && f.value === '2024-01-01')).toBe(true)
+    expect(info?.removableIn).toBe('light')
+  })
+
+  it('el inventario marca el IDIT de nivel superior como individual (ya no never)', async () => {
+    const report = await videoDomain.scan(AVI_IDIT)
+    const idit = report.entries.find((e) => e.key === 'IDIT')
+    expect(idit).toBeDefined()
+    expect(idit?.removal).toBe('individual')
+    expect(idit?.sensitivity).toBe('medium')
+    expect(idit?.where).toBe('RIFF > IDIT')
+  })
+
+  it('light ["info"] quita el IDIT de nivel superior y el RIFF sigue válido', async () => {
+    const out = await stripVideo(AVI_IDIT, 'avi', { mode: 'light', blocks: ['info'] })
+    const txt = textOf(out)
+    expect(txt).not.toContain('IDIT')
+    expect(txt).not.toContain('2024-01-01')
+    expect(txt).not.toContain('INAM') // LIST INFO también fuera
+    expect(txt).toContain('hdrl')
+    expect(txt).toContain('movi')
+    expect(txt).toContain('FRAME1')
+    expect(txt).toContain('BASURA') // JUNK no seleccionado en light
+    // cabecera y tamaño RIFF coherentes
+    expect(textOf(out.slice(0, 4))).toBe('RIFF')
+    expect(textOf(out.slice(8, 12))).toBe('AVI ')
+    expect(out.length - 8).toBe(readLE(out, 4))
+  })
+
+  it('light sin ["info"] conserva el IDIT de nivel superior', async () => {
+    const out = await stripVideo(AVI_IDIT, 'avi', { mode: 'light', blocks: ['junk'] })
+    expect(textOf(out)).toContain('2024-01-01')
+    expect(out.length - 8).toBe(readLE(out, 4))
+  })
+
+  it('deep quita el IDIT de nivel superior con el bloque info', async () => {
+    const out = await stripVideo(AVI_IDIT, 'avi', { mode: 'deep', blocks: [] })
+    expect(textOf(out)).not.toContain('2024-01-01')
+    expect(out.length - 8).toBe(readLE(out, 4))
+  })
+
+  it('un IDIT dentro de LIST INFO se borra con el contenedor (comportamiento intacto)', async () => {
+    const report = await videoDomain.scan(AVI_IDIT_IN_INFO)
+    expect(report.entries.find((e) => e.key === 'IDIT')?.removal).toBe('with-container')
+    const out = await stripVideo(AVI_IDIT_IN_INFO, 'avi', { mode: 'light', blocks: ['info'] })
+    expect(textOf(out)).not.toContain('2024-01-01')
+    expect(out.length - 8).toBe(readLE(out, 4))
+  })
+
+  it('un AVI sin IDIT no cambia de comportamiento', async () => {
+    const out = await stripVideo(AVI, 'avi', { mode: 'light', blocks: ['info'] })
+    expect(textOf(out)).not.toContain('Mi peli') // LIST INFO fuera
+    expect(textOf(out)).toContain('BASURA') // JUNK conservado
+    expect(out.length - 8).toBe(readLE(out, 4))
+  })
+
+  it('un IDIT de nivel superior SIN valor no aparece ni en el bloque ni en el inventario (F5)', async () => {
+    const src = concat([
+      ascii('RIFF'),
+      u32le(0),
+      ascii('AVI '),
+      aviList('hdrl', [aviChunk('avih', mainAviHeader()), aviVideoStream()]),
+      aviChunk('IDIT', new Uint8Array()),
+      aviList('movi', [aviChunk('00dc', ascii('FRAME1'))]),
+    ])
+    const report = await videoDomain.scan(src)
+    expect(report.entries.some((e) => e.key === 'IDIT')).toBe(false)
+    expect(report.blocks.find((b) => b.id === 'info')).toBeUndefined()
+  })
+
+  it('el bloque info de AVI se etiqueta incluyendo el IDIT (F6)', async () => {
+    const report = await videoDomain.scan(AVI_IDIT)
+    expect(report.blocks.find((b) => b.id === 'info')?.label).toBe('Información (LIST INFO/IDIT)')
+  })
+})
+
 /* ════════════ Inventario uuid (C2PA), GPS y moov anidado ════════════ */
 
 /** mp4 con `uuid` C2PA de nivel superior y otro `uuid` hijo DIRECTO de `moov`. */
@@ -1010,8 +1116,9 @@ describe('videoDomain — inventario uuid (C2PA) y GPS', () => {
     expect(inMoov?.label).toBe('C2PA')
   })
 
-  it('el uuid de moov se borra con el bloque junk, así que debe verse en el inventario', async () => {
-    const out = await stripVideo(MP4_UUID_C2PA_MOOV, 'mp4', { mode: 'light', blocks: ['junk'] })
+  it('el uuid C2PA se borra con el bloque c2pa (no con junk), así que debe verse en el inventario', async () => {
+    // Antes el C2PA caía en 'junk' (fuga): ahora tiene su propio bloque 'c2pa'.
+    const out = await stripVideo(MP4_UUID_C2PA_MOOV, 'mp4', { mode: 'light', blocks: ['c2pa'] })
     expect(textOf(out)).not.toContain('C2PADATA') // uuid dentro de moov eliminado
     expect(textOf(out)).not.toContain('C2PATOP') // uuid de nivel superior eliminado
   })
@@ -1021,5 +1128,330 @@ describe('videoDomain — inventario uuid (C2PA) y GPS', () => {
     const gps = report.entries.find((e) => e.key === '©xyz')
     expect(gps?.label).toBe('GPS')
     expect(gps?.removal).toBe('with-container')
+  })
+})
+
+/* ════════════ Fugas de video: 'timestamps' y 'c2pa' ════════════ */
+
+/** Busca recursivamente la primera caja `type` (recorre contenedores). */
+function findBox(bytes: Uint8Array, type: string): TestBox | null {
+  const find = (start: number, end: number): TestBox | null => {
+    let i = start
+    while (i + 8 <= end) {
+      const size = readU32BE(bytes, i)
+      if (size < 8 || i + size > end) return null
+      const t = asciiAt(bytes, i + 4)
+      if (t === type) return { type: t, start: i, end: i + size, dataStart: i + 8 }
+      const nested = find(i + 8, i + size)
+      if (nested) return nested
+      i += size
+    }
+    return null
+  }
+  return find(0, bytes.length)
+}
+
+/** creation_time/modification_time de una FullBox mvhd/tkhd/mdhd (v0 4B / v1 8B). */
+function readBoxTimes(bytes: Uint8Array, type: string): { creation: number; modification: number } | null {
+  const box = findBox(bytes, type)
+  if (!box) return null
+  const d = box.dataStart
+  const version = bytes[d]
+  if (version === 0) return { creation: readU32BE(bytes, d + 4), modification: readU32BE(bytes, d + 8) }
+  if (version === 1) {
+    return {
+      creation: readU32BE(bytes, d + 4) * 2 ** 32 + readU32BE(bytes, d + 8),
+      modification: readU32BE(bytes, d + 12) * 2 ** 32 + readU32BE(bytes, d + 16),
+    }
+  }
+  return null
+}
+
+const UUID_C2PA_HEX = 'd8fec3d61b0e483c92975828877c0c85'
+const UUID_XMP_HEX = 'be7acfcb97a942e89c71999491e3afac'
+const UUID_UNKNOWN_HEX = '00112233445566778899aabbccddeeff'
+
+/** mp4 con mvhd v0, tkhd v0 y mdhd v1 con fechas reales (duración 90 s). */
+const MP4_TIMES = concat([
+  mp4Box('ftyp', concat([ascii('isom'), u32be(0)])),
+  mp4Box(
+    'moov',
+    concat([
+      mp4Box(
+        'mvhd',
+        concat([Uint8Array.of(0, 0, 0, 0), u32be(3600), u32be(7200), u32be(1000), u32be(90000), new Uint8Array(80)]),
+      ),
+      mp4Box(
+        'trak',
+        concat([
+          mp4Box(
+            'tkhd',
+            concat([
+              Uint8Array.of(0, 0, 0, 0),
+              u32be(3600), // creation_time
+              u32be(7200), // modification_time
+              u32be(1), // track_ID
+              u32be(0), // reserved
+              u32be(90000), // duration
+              new Uint8Array(8), // reserved[2]
+              new Uint8Array(2), // layer
+              new Uint8Array(2), // alternate_group
+              new Uint8Array(2), // volume
+              new Uint8Array(2), // reserved
+              new Uint8Array(36), // matrix
+              u32be(640 * 65536), // width 16.16
+              u32be(480 * 65536), // height 16.16
+            ]),
+          ),
+          mp4Box(
+            'mdia',
+            concat([
+              mp4Box(
+                'mdhd',
+                concat([
+                  Uint8Array.of(1, 0, 0, 0), // version 1 + flags
+                  u32be(0), u32be(3600), // creation_time (8B)
+                  u32be(0), u32be(7200), // modification_time (8B)
+                  u32be(90000), // timescale
+                  u32be(0), u32be(90000), // duration (8B)
+                  new Uint8Array(4), // language + predefined
+                ]),
+              ),
+            ]),
+          ),
+        ]),
+      ),
+    ]),
+  ),
+  mp4Box('mdat', ascii('VIDEO')),
+])
+
+/** mkv con Info{DateUTC, MuxingApp, WritingApp} reales y un Cluster marcador. */
+const MKV_TIMES = concat([
+  ebmlEl(0x1a45dfa3, ebmlEl(0x4282, ascii('matroska'))),
+  ebmlEl(
+    0x18538067,
+    concat([
+      ebmlEl(
+        0x1549a966,
+        concat([
+          ebmlEl(0x2ad7b1, uintBE(1000000)), // TimestampScale
+          ebmlEl(0x4489, f64le(90000)), // Duration → 90 s
+          ebmlEl(0x4461, uintBE(123456789, 8)), // DateUTC (8 bytes)
+          ebmlEl(0x4d80, ascii('ffmpeg')), // MuxingApp
+          ebmlEl(0x5741, ascii('Lavf60')), // WritingApp
+        ]),
+      ),
+      ebmlEl(0x1f43b675, ascii('MARCADOR')), // Cluster
+    ]),
+  ),
+])
+
+/** mp4 con uuid C2PA (top-level y en moov), uuid XMP y uuid desconocido. */
+const MP4_UUID_ALL = concat([
+  mp4Box('ftyp', concat([ascii('isom'), u32be(0)])),
+  mp4Box('moov', concat([MVHD, mp4Box('uuid', concat([hexBytes(UUID_C2PA_HEX), ascii('C2PAMOOV')]))])),
+  mp4Box('uuid', concat([hexBytes(UUID_C2PA_HEX), ascii('C2PATOP')])),
+  mp4Box('uuid', concat([hexBytes(UUID_XMP_HEX), ascii('XMPDATA')])),
+  mp4Box('uuid', concat([hexBytes(UUID_UNKNOWN_HEX), ascii('UNKNOWNDATA')])),
+  mp4Box('mdat', ascii('VIDEO')),
+])
+
+describe('videoDomain — fuga timestamps (mp4/mov)', () => {
+  it('scan expone el bloque timestamps (light) con las fechas reales', async () => {
+    const report = await videoDomain.scan(MP4_TIMES)
+    const ts = report.blocks.find((b) => b.id === 'timestamps')
+    expect(ts).toBeDefined()
+    expect(ts?.removableIn).toBe('light')
+    expect(ts?.fields.some((f) => f.name === 'Fecha de creación')).toBe(true)
+    expect(ts?.fields.some((f) => f.name === 'Fecha de modificación')).toBe(true)
+  })
+
+  it('light ["timestamps"]: mvhd/tkhd/mdhd a cero y la duración NO cambia', async () => {
+    const out = await stripVideo(MP4_TIMES, 'mp4', { mode: 'light', blocks: ['timestamps'] })
+    expect(out.length).toBe(MP4_TIMES.length)
+    for (const type of ['mvhd', 'tkhd', 'mdhd']) {
+      const times = readBoxTimes(out, type)
+      expect(times, `${type} presente`).not.toBeNull()
+      expect(times?.creation, `${type} creation_time`).toBe(0)
+      expect(times?.modification, `${type} modification_time`).toBe(0)
+    }
+    // La duración (mvhd) y el bloque técnico 'format' siguen intactos.
+    const report = await videoDomain.scan(out)
+    expect(report.fields.find((f) => f.name === 'Duración')?.value).toBe('1:30')
+    expect(report.blocks.find((b) => b.id === 'format')?.removableIn).toBe('never')
+    expect(report.blocks.some((b) => b.id === 'timestamps')).toBe(false)
+  })
+
+  it('deep (sin bloques) también pone a cero mvhd/tkhd/mdhd y la duración NO cambia', async () => {
+    const out = await stripVideo(MP4_TIMES, 'mp4', { mode: 'deep', blocks: [] })
+    expect(out.length).toBe(MP4_TIMES.length)
+    for (const type of ['mvhd', 'tkhd', 'mdhd']) {
+      const times = readBoxTimes(out, type)
+      expect(times, `${type} presente`).not.toBeNull()
+      expect(times?.creation, `${type} creation_time`).toBe(0)
+      expect(times?.modification, `${type} modification_time`).toBe(0)
+    }
+    // La duración (mvhd) y el bloque técnico 'format' siguen intactos.
+    const report = await videoDomain.scan(out)
+    expect(report.fields.find((f) => f.name === 'Duración')?.value).toBe('1:30')
+    expect(report.blocks.some((b) => b.id === 'timestamps')).toBe(false)
+  })
+
+  it('light sin ["timestamps"] deja las fechas como estaban', async () => {
+    const out = await stripVideo(MP4_TIMES, 'mp4', { mode: 'light', blocks: ['tags'] })
+    expect(readBoxTimes(out, 'mvhd')?.creation).toBe(3600)
+  })
+})
+
+describe('videoDomain — fuga timestamps (mkv/webm)', () => {
+  it('scan expone el bloque timestamps del mkv con sus tres campos', async () => {
+    const report = await videoDomain.scan(MKV_TIMES)
+    const ts = report.blocks.find((b) => b.id === 'timestamps')
+    expect(ts?.removableIn).toBe('light')
+    expect(ts?.fields.map((f) => f.name)).toEqual(
+      expect.arrayContaining(['Fecha (UTC)', 'Aplicación de multiplexado', 'Aplicación de escritura']),
+    )
+  })
+
+  it('light ["timestamps"]: DateUTC/MuxingApp/WritingApp fuera y tamaño intacto', async () => {
+    const src = MKV_TIMES
+    const out = await stripVideo(src, 'mkv', { mode: 'light', blocks: ['timestamps'] })
+    expect(out.length).toBe(src.length) // mismo tamaño: Void del mismo largo
+    const txt = textOf(out)
+    expect(txt).not.toContain('ffmpeg') // MuxingApp sustituido por Void
+    expect(txt).not.toContain('Lavf60') // WritingApp sustituido por Void
+    // El inventario del resultado ya no ve el bloque timestamps.
+    const report = await videoDomain.scan(out)
+    expect(report.blocks.some((b) => b.id === 'timestamps')).toBe(false)
+    // El layout no se movió: el Cluster sigue en la misma posición.
+    expect(indexOfBytes(out, ascii('MARCADOR'))).toBe(indexOfBytes(src, ascii('MARCADOR')))
+  })
+
+  it('deep (sin bloques) también quita DateUTC/MuxingApp/WritingApp y el tamaño no cambia', async () => {
+    const src = MKV_TIMES
+    const out = await stripVideo(src, 'mkv', { mode: 'deep', blocks: [] })
+    expect(out.length).toBe(src.length) // mismo tamaño: Void del mismo largo
+    // Los tres elementos de Info desaparecen (sustituidos por Void).
+    expect(containsBytes(out, ID_BYTES[0x4461])).toBe(false) // DateUTC fuera
+    expect(containsBytes(out, ID_BYTES[0x4d80])).toBe(false) // MuxingApp fuera
+    expect(containsBytes(out, ID_BYTES[0x5741])).toBe(false) // WritingApp fuera
+    const txt = textOf(out)
+    expect(txt).not.toContain('ffmpeg')
+    expect(txt).not.toContain('Lavf60')
+    // El inventario del resultado ya no ve el bloque timestamps.
+    const report = await videoDomain.scan(out)
+    expect(report.blocks.some((b) => b.id === 'timestamps')).toBe(false)
+    // El layout no se movió: el Cluster sigue en la misma posición.
+    expect(indexOfBytes(out, ascii('MARCADOR'))).toBe(indexOfBytes(src, ascii('MARCADOR')))
+  })
+})
+
+describe('videoDomain — fuga c2pa (cajas uuid)', () => {
+  it('scan: C2PA y XMP en el bloque c2pa (high); uuid desconocido sigue en junk', async () => {
+    const report = await videoDomain.scan(MP4_UUID_ALL)
+    const c2pa = report.blocks.find((b) => b.id === 'c2pa')
+    expect(c2pa).toBeDefined()
+    expect(c2pa?.removableIn).toBe('light')
+    expect(c2pa?.fields.every((f) => f.sensitivity === 'high')).toBe(true)
+    expect(c2pa?.fields.map((f) => f.name)).toEqual(expect.arrayContaining(['C2PA', 'XMP']))
+    expect(report.blocks.some((b) => b.id === 'junk')).toBe(true) // el uuid desconocido
+  })
+
+  it('entries: uuid C2PA/XMP en high, uuid desconocido en medium', async () => {
+    const report = await videoDomain.scan(MP4_UUID_ALL)
+    expect(report.entries.find((e) => e.label === 'C2PA')?.sensitivity).toBe('high')
+    expect(report.entries.find((e) => e.label === 'XMP')?.sensitivity).toBe('high')
+    expect(report.entries.find((e) => e.label === 'UUID desconocido')?.sensitivity).toBe('medium')
+  })
+
+  it('light ["c2pa"] borra C2PA/XMP (top-level y moov) y conserva el desconocido', async () => {
+    const out = await stripVideo(MP4_UUID_ALL, 'mp4', { mode: 'light', blocks: ['c2pa'] })
+    const txt = textOf(out)
+    expect(txt).not.toContain('C2PATOP')
+    expect(txt).not.toContain('C2PAMOOV')
+    expect(txt).not.toContain('XMPDATA')
+    expect(txt).toContain('UNKNOWNDATA')
+    expectConsistentSizes(out)
+  })
+
+  it('light ["junk"] borra el uuid desconocido y conserva C2PA/XMP', async () => {
+    const out = await stripVideo(MP4_UUID_ALL, 'mp4', { mode: 'light', blocks: ['junk'] })
+    const txt = textOf(out)
+    expect(txt).not.toContain('UNKNOWNDATA')
+    expect(txt).toContain('C2PATOP')
+    expect(txt).toContain('XMPDATA')
+  })
+})
+
+describe('videoDomain — entrada malformada', () => {
+  it('strip con bloques nuevos devuelve los bytes intactos y no lanza', async () => {
+    const bad = Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    const out = await stripVideo(bad, 'mp4', { mode: 'light', blocks: ['timestamps', 'c2pa'] })
+    expect(out).toEqual(bad)
+    const report = await videoDomain.scan(bad)
+    expect(report).toEqual({ fields: [], count: 0, blocks: [], entries: [] })
+  })
+})
+
+/* ════════════ Verificación posterior (verify-after-clean) ════════════ */
+
+describe('videoDomain — verificación posterior (verify-after-clean)', () => {
+  it('MP4 light ["tags"] queda limpio (no "remaining" fantasma)', async () => {
+    const result = await stripMetadata({
+      bytes: MP4,
+      name: 'v.mp4',
+      kind: 'mp4',
+      config: { mode: 'light', blocks: ['tags'] },
+    })
+    expect(result.verification?.status).toBe('clean')
+  })
+
+  it('MP4 deep queda limpio', async () => {
+    const result = await stripMetadata({
+      bytes: MP4,
+      name: 'v.mp4',
+      kind: 'mp4',
+      config: { mode: 'deep', blocks: [] },
+    })
+    expect(result.verification?.status).toBe('clean')
+  })
+
+  it('MOV light ["tags"] y deep quedan limpios', async () => {
+    const light = await stripMetadata({
+      bytes: MOV,
+      name: 'v.mov',
+      kind: 'mov',
+      config: { mode: 'light', blocks: ['tags'] },
+    })
+    expect(light.verification?.status).toBe('clean')
+    const deep = await stripMetadata({
+      bytes: MOV,
+      name: 'v.mov',
+      kind: 'mov',
+      config: { mode: 'deep', blocks: [] },
+    })
+    expect(deep.verification?.status).toBe('clean')
+  })
+
+  it('MP4 light ["timestamps"] con fechas reales queda limpio (fechas puestas a cero)', async () => {
+    const result = await stripMetadata({
+      bytes: MP4_TIMES,
+      name: 'v.mp4',
+      kind: 'mp4',
+      config: { mode: 'light', blocks: ['timestamps'] },
+    })
+    expect(result.verification?.status).toBe('clean')
+  })
+
+  it('MP4 que conserva etiquetas eliminables reporta "remaining"', async () => {
+    const result = await stripMetadata({
+      bytes: MP4,
+      name: 'v.mp4',
+      kind: 'mp4',
+      config: { mode: 'light', blocks: ['junk'] },
+    })
+    expect(result.verification?.status).toBe('remaining')
+    expect(result.verification?.remaining).toBeGreaterThan(0)
   })
 })

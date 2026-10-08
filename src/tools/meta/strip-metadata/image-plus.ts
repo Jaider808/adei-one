@@ -31,15 +31,24 @@
  *   tipo 4). El scan usa `exifr` (import dinámico) y traduce las claves a
  *   español (Make→Fabricante, Model→Modelo, DateTimeOriginal→Fecha original,
  *   GPSLatitude→Latitud GPS…). El strip elimina de nivel superior las cajas
- *   'uuid'/'free'/'skip'/'wide'/'pict' (junk/marca) de forma lossless, pero
- *   NUNCA elimina 'meta' (contiene la info esencial de items para decodificar).
+ *   'uuid'/'free'/'skip'/'wide'/'pict' (junk/marca) de forma lossless Y pon a
+ *   cero in situ el payload del item `Exif` alojado dentro de `meta`
+ *   (parseando `iinf`/`iloc`): HEIC ubica sus items por offsets absolutos, así
+ *   que el borrado conserva el tamaño total y no mueve ningún offset.
+ *   `iloc` resuelve `construction_method` 0 (offset de archivo) y 1 (relativo
+ *   al payload de `idat`); 2 (item offset) queda fuera de alcance y se trata
+ *   como passthrough. El inventario es honesto: las entradas EXIF solo se
+ *   declaran borrables ('with-container') cuando el layout de ESE archivo es
+ *   realmente resoluble (`heicExifErasable`); si no, se declaran conservadas.
  *   El scan reporta además el bloque 'format' (nunca se borra) con las marcas
  *   del ftyp y, si exifr las provee, el ancho/alto.
- *   El borrado fino del item EXIF dentro de `meta` (iinf/iloc) queda para una
- *   fase próxima: si no hay nada que quitar, passthrough de los mismos bytes.
+ *   No se tocan `iinf`/`iloc`/`idat` (sería un remux con desplazamiento de
+ *   offsets): solo se ponen a cero los bytes del EXIF. Los items XMP (`mime`)
+ *   quedan para una fase próxima porque su content_type no se puede
+ *   determinar de forma fiable sin el nombre del item.
  *
- * Nunca lanza: parseo inválido → `EMPTY_REPORT` (scan) o passthrough con
- * mensaje claro ("…fase próxima") vía `report` (strip).
+ * Nunca lanza: parseo inválido → `EMPTY_REPORT` (scan) o passthrough de los
+ * mismos bytes (strip).
  */
 import {
   BLOCK_EXIF,
@@ -812,6 +821,291 @@ function walkIsoBoxes(bytes: Uint8Array): IsoBox[] {
   return out
 }
 
+/** Cabecera de una FullBox dentro de `meta`: 8 bytes de caja + 4 de versión/flags. */
+const FULL_BOX_HEADER = 12
+
+/** Recorre las cajas ISO-BMFF contenidas en `[start, end)`. Devuelve [] si algo es inconsistente. */
+function walkIsoBoxesIn(bytes: Uint8Array, start: number, end: number): IsoBox[] {
+  const out: IsoBox[] = []
+  let i = start
+  while (i + 8 <= end) {
+    const size = readU32BE(bytes, i)
+    const type = asciiAt(bytes, i + 4)
+    let headerSize = 8
+    let total = size
+    if (size === 1) {
+      if (i + 16 > end) return []
+      const hi = readU32BE(bytes, i + 8)
+      const lo = readU32BE(bytes, i + 12)
+      total = hi * 0x100000000 + lo
+      headerSize = 16
+      if (total > 0xffffffff || i + total > end) return []
+    } else if (size === 0) {
+      total = end - i
+    }
+    if (total < headerSize || i + total > end) return []
+    out.push({ type, start: i, end: i + total })
+    i += total
+  }
+  return out
+}
+
+/** Lee `size` bytes BE como entero sin signo (0 → 0; 4 → u32; 8 → 64 bits). */
+function readSizedUintBE(bytes: Uint8Array, offset: number, size: number): number {
+  if (size === 4) return readU32BE(bytes, offset)
+  if (size === 8) {
+    const hi = readU32BE(bytes, offset)
+    const lo = readU32BE(bytes, offset + 4)
+    return hi * 0x100000000 + lo
+  }
+  return 0
+}
+
+/**
+ * Localiza en `meta > iinf` el/los `item_ID` de tipo `Exif`. `infe` versión 2
+ * usa item_ID de 16 bits y versión ≥ 3 de 32 bits; versiones anteriores no
+ * exponen `item_type`, así que no se pueden identificar (se ignoran). Nunca lanza.
+ */
+function findExifItemIds(bytes: Uint8Array, children: IsoBox[]): Set<number> {
+  const ids = new Set<number>()
+  try {
+    const iinf = children.find((b) => b.type === 'iinf')
+    if (!iinf || iinf.start + FULL_BOX_HEADER > iinf.end) return ids
+    const version = bytes[iinf.start + 8]
+    let p = iinf.start + FULL_BOX_HEADER
+    let count: number
+    if (version === 0) {
+      if (p + 2 > iinf.end) return ids
+      count = readU16BE(bytes, p)
+      p += 2
+    } else {
+      if (p + 4 > iinf.end) return ids
+      count = readU32BE(bytes, p)
+      p += 4
+    }
+    for (let n = 0; n < count && p + 8 <= iinf.end; n++) {
+      const size = readU32BE(bytes, p)
+      const type = asciiAt(bytes, p + 4)
+      if (size < 8 || p + size > iinf.end) return ids
+      if (type === 'infe' && p + FULL_BOX_HEADER <= p + size) {
+        const infeVersion = bytes[p + 8]
+        let q = p + FULL_BOX_HEADER
+        let itemId = -1
+        if (infeVersion === 2) {
+          itemId = readU16BE(bytes, q)
+          q += 2
+        } else if (infeVersion >= 3) {
+          itemId = readU32BE(bytes, q)
+          q += 4
+        }
+        q += 2 // item_protection_index
+        if (itemId >= 0 && q + 4 <= p + size && asciiAt(bytes, q) === 'Exif') ids.add(itemId)
+      }
+      p += size
+    }
+  } catch {
+    return new Set<number>()
+  }
+  return ids
+}
+
+/** Extent de un item `iloc` con su método de construcción y base. */
+interface IlocExtent {
+  constructionMethod: number
+  baseOffset: number
+  offset: number
+  length: number
+}
+
+/**
+ * Localiza los extents de los `targetIds` en `meta > iloc`. Devuelve null si el
+ * layout no es abordable (versión/anchos no soportados, offsets fuera de rango…).
+ * Los anchos variables (`offset_size`/`length_size`/`base_offset_size`, más
+ * `construction_method` en versión ≥ 1) se leen del propio box. Nunca lanza.
+ */
+function findIlocExtents(bytes: Uint8Array, children: IsoBox[], targetIds: Set<number>): IlocExtent[] | null {
+  try {
+    const iloc = children.find((b) => b.type === 'iloc')
+    if (!iloc || iloc.start + FULL_BOX_HEADER > iloc.end) return null
+    const version = bytes[iloc.start + 8]
+    let p = iloc.start + FULL_BOX_HEADER
+    if (p + 2 > iloc.end) return null
+    const offsetsByte = bytes[p]
+    const offsetSize = offsetsByte >> 4
+    const lengthSize = offsetsByte & 0x0f
+    p += 1
+    const basesByte = bytes[p]
+    const baseOffsetSize = basesByte >> 4
+    const indexSize = version === 1 || version === 2 ? basesByte & 0x0f : 0
+    p += 1
+    const supported = (s: number): boolean => s === 0 || s === 4 || s === 8
+    if (!supported(offsetSize) || !supported(lengthSize) || !supported(baseOffsetSize) || !supported(indexSize)) {
+      return null
+    }
+    let itemCount: number
+    if (version < 2) {
+      if (p + 2 > iloc.end) return null
+      itemCount = readU16BE(bytes, p)
+      p += 2
+    } else {
+      if (p + 4 > iloc.end) return null
+      itemCount = readU32BE(bytes, p)
+      p += 4
+    }
+    const out: IlocExtent[] = []
+    for (let n = 0; n < itemCount; n++) {
+      let itemId: number
+      if (version < 2) {
+        if (p + 2 > iloc.end) return null
+        itemId = readU16BE(bytes, p)
+        p += 2
+      } else {
+        if (p + 4 > iloc.end) return null
+        itemId = readU32BE(bytes, p)
+        p += 4
+      }
+      let constructionMethod = 0
+      if (version === 1 || version === 2) {
+        if (p + 2 > iloc.end) return null
+        constructionMethod = readU16BE(bytes, p) & 0x0f
+        p += 2
+      }
+      if (p + 2 + baseOffsetSize + 2 > iloc.end) return null
+      p += 2 // data_reference_index
+      const baseOffset = readSizedUintBE(bytes, p, baseOffsetSize)
+      p += baseOffsetSize
+      const extentCount = readU16BE(bytes, p)
+      p += 2
+      for (let e = 0; e < extentCount; e++) {
+        const needed = ((version === 1 || version === 2) && indexSize > 0 ? indexSize : 0) + offsetSize + lengthSize
+        if (p + needed > iloc.end) return null
+        if ((version === 1 || version === 2) && indexSize > 0) p += indexSize
+        const offset = readSizedUintBE(bytes, p, offsetSize)
+        p += offsetSize
+        const length = readSizedUintBE(bytes, p, lengthSize)
+        p += lengthSize
+        if (targetIds.has(itemId)) out.push({ constructionMethod, baseOffset, offset, length })
+      }
+    }
+    return out
+  } catch {
+    return null
+  }
+}
+
+/** Región absoluta [start, start+length) de un extent `iloc` ya resuelto. */
+interface ResolvedExtent {
+  start: number
+  length: number
+}
+
+/** Tamaño de la cabecera de una caja ISO-BMFF (8, o 16 si usa largesize). */
+function isoBoxHeaderSize(bytes: Uint8Array, start: number): number {
+  return readU32BE(bytes, start) === 1 ? 16 : 8
+}
+
+/**
+ * Resuelve los extents `iloc` de los `targetIds` a rangos absolutos del archivo:
+ * - `construction_method` 0 → offset de archivo (`base_offset + offset`).
+ * - `construction_method` 1 → relativo al payload de la caja `idat` de `meta`
+ *   (`idat_data_start + base_offset + offset`).
+ * - `construction_method` 2 (item offset) u otro → no resoluble.
+ * Devuelve null si el layout no es abordable o algún rango se sale del archivo.
+ * NO muta: la validación completa precede a cualquier escritura.
+ */
+function resolveMetaExifExtents(
+  bytes: Uint8Array,
+  children: IsoBox[],
+  targetIds: Set<number>,
+): ResolvedExtent[] | null {
+  const extents = findIlocExtents(bytes, children, targetIds)
+  if (!extents || extents.length === 0) return null
+  const idat = children.find((b) => b.type === 'idat')
+  const idatDataStart = idat ? idat.start + isoBoxHeaderSize(bytes, idat.start) : -1
+  const out: ResolvedExtent[] = []
+  for (const extent of extents) {
+    let base: number
+    if (extent.constructionMethod === 0) {
+      base = 0
+    } else if (extent.constructionMethod === 1) {
+      if (idatDataStart < 0) return null
+      base = idatDataStart
+    } else {
+      // `construction_method` 2 (item offset) exige resolver offsets de otros
+      // items: fuera de alcance → passthrough honesto.
+      return null
+    }
+    const start = base + extent.baseOffset + extent.offset
+    if (start < 0 || extent.length < 0 || start + extent.length > bytes.length) return null
+    out.push({ start, length: extent.length })
+  }
+  return out
+}
+
+/**
+ * Rangos absolutos del item `Exif` dentro de `meta`, o null si el contenedor no
+ * permite resolverlos (sin `meta`, sin item Exif, `iloc` no soportado, fuera de
+ * rango…). Nunca lanza ni muta.
+ */
+function findMetaExifRanges(bytes: Uint8Array): ResolvedExtent[] | null {
+  try {
+    const meta = walkIsoBoxes(bytes).find((b) => b.type === 'meta')
+    if (!meta || meta.start + FULL_BOX_HEADER > meta.end) return null
+    const children = walkIsoBoxesIn(bytes, meta.start + FULL_BOX_HEADER, meta.end)
+    if (children.length === 0) return null
+    const itemIds = findExifItemIds(bytes, children)
+    if (itemIds.size === 0) return null
+    return resolveMetaExifExtents(bytes, children, itemIds)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * ¿Puede `stripHeic` eliminar realmente el EXIF de ESTE archivo en modo ligero
+ * (bloque 'exif')? Decide la honestidad del inventario (Finding 1):
+ * - Vía A: caja `uuid` de nivel superior; `stripHeic` la sustituye por un
+ *   `free` del MISMO tamaño (convención EXIF de algunos HEIC).
+ * - Vía B: item `Exif` dentro de `meta` con extents `iloc` resolubles.
+ *
+ * CAVEAT RESIDUAL (documentado a propósito): las cajas `free`/`skip` NO cuentan
+ * por sí solas, porque son relleno y no un contenedor EXIF fiable. Si un archivo
+ * llevara su EXIF en una caja de nivel superior distinta de `uuid`, o exifr
+ * leyera un EXIF cuyo contenedor no es enumerable aquí, el inventario podría
+ * INFRA-declarar (`never` sobre un dato que el strip sí borra). Nunca
+ * SOBRE-declara: la regla dura de esta herramienta es no prometer jamás un
+ * borrado que no ocurre.
+ */
+function heicExifErasable(bytes: Uint8Array): boolean {
+  if (walkIsoBoxes(bytes).some((b) => b.type === 'uuid')) return true
+  return findMetaExifRanges(bytes) !== null
+}
+
+/**
+ * Pone a cero IN SITU los bytes del payload del item `Exif` que vive dentro de
+ * `meta`. No mueve ningún offset ni cambia el tamaño del archivo (HEIC ubica
+ * sus items por offsets absolutos). Devuelve true SOLO si al menos un byte
+ * cambió de valor: si el layout no es abordable, o los extents ya eran cero (o
+ * de longitud 0), no toca nada y devuelve false → passthrough honesto.
+ */
+function zeroMetaExifPayload(bytes: Uint8Array): boolean {
+  const ranges = findMetaExifRanges(bytes)
+  if (!ranges || ranges.length === 0) return false
+  let changed = false
+  for (const { start, length } of ranges) {
+    for (let i = start; i < start + length; i++) {
+      if (bytes[i] !== 0) {
+        changed = true
+        break
+      }
+    }
+    if (changed) break
+  }
+  if (!changed) return false
+  for (const { start, length } of ranges) bytes.fill(0, start, start + length)
+  return true
+}
+
 /** Traducción de claves EXIF (exifr) a español para el visor. */
 const HEIC_EXIF_LABELS: Record<string, { label: string; sensitivity: MetadataField['sensitivity'] }> = {
   Make: { label: 'Fabricante', sensitivity: 'medium' },
@@ -878,12 +1172,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * defecto `xmp`), con su ruta real. Los desconocidos se listan con su clave
  * cruda. Devuelve true si enumeró XMP.
  *
- * `removal: 'never'` en TODAS las entradas: `stripHeic` solo sustituye cajas de
- * nivel superior (`uuid`/`free`/`skip`/`wide`/`pict`) y NUNCA elimina el EXIF
- * que vive dentro de `meta` (limitación documentada arriba). La etiqueta debe
- * reflejar lo que el limpiador realmente hace.
+ * Las entradas EXIF (`ifd0`/`exif`/`gps`/`interop`/`iptc`) llevan
+ * `removal: 'with-container'` SOLO si `exifRemovable` es cierto: `stripHeic`
+ * localiza el item `Exif` dentro de `meta` (vía `iinf`/`iloc`) y pone su payload
+ * a cero in situ; si el layout de ESTE archivo no es resoluble, el borrado no
+ * ocurre y la entrada se declara conservada (`never`). Las entradas XMP se dejan
+ * siempre en `'never'`: el borrado del item `mime`/XMP queda para una fase
+ * próxima porque su content_type no se puede determinar de forma fiable.
  */
-function pushStructuredExifEntries(meta: Record<string, unknown>, entries: MetaEntry[]): boolean {
+function pushStructuredExifEntries(
+  meta: Record<string, unknown>,
+  entries: MetaEntry[],
+  exifRemovable: boolean,
+): boolean {
   let sawXmp = false
   for (const [blockKey, blockValue] of Object.entries(meta)) {
     if (blockKey === 'errors' || blockKey === 'thumbnail' || blockKey === 'icc') continue
@@ -913,7 +1214,9 @@ function pushStructuredExifEntries(meta: Record<string, unknown>, entries: MetaE
         label: mapped?.label,
         value: cleanText(heicValue(key, value)),
         sensitivity: mapped?.sensitivity ?? (key.startsWith('GPS') ? 'high' : 'medium'),
-        removal: 'never',
+        // El item Exif entero se pone a cero en modo ligero (bloque 'exif')
+        // SOLO si el layout de ESTE archivo es resoluble (honestidad).
+        removal: exifRemovable ? 'with-container' : 'never',
       })
     }
   }
@@ -997,7 +1300,7 @@ async function scanHeic(bytes: Uint8Array): Promise<MetadataReport> {
     }
     // Inventario exhaustivo: TODO ítem EXIF (también los no mapeados) con su ruta.
     const structured = (await exifr.parse(bytes, STRUCTURED_EXIFR_OPTIONS)) as Record<string, unknown> | undefined
-    if (structured) pushStructuredExifEntries(structured, entries)
+    if (structured) pushStructuredExifEntries(structured, entries, heicExifErasable(bytes))
   } catch {
     /* sin EXIF legible: solo se reporta el formato */
   }
@@ -1026,43 +1329,42 @@ function freeBox(total: number): Uint8Array {
 }
 
 /**
- * Elimina las cajas junk/marca de nivel superior (nunca 'meta'). Nunca rompe
- * el layout: HEIC ubica sus items por offsets absolutos (`iloc`), así que
- * cada caja eliminada se sustituye por un `free` del MISMO tamaño. Es el
- * mismo criterio que mat2: HEIC no admite limpieza "a fondo" (deep se degrada
- * a esta limpieza segura).
+ * Limpieza HEIC lossless. Dos cirugías, ambas sin mover offsets:
+ *  1. Las cajas junk/marca de nivel superior (`uuid`/`free`/`skip`/`wide`/`pict`)
+ *     se sustituyen por un `free` del MISMO tamaño.
+ *  2. El item `Exif` que vive dentro de `meta` se localiza (`iinf`/`iloc`) y su
+ *     payload se pone a cero IN SITU (`zeroMetaExifPayload`).
+ * HEIC ubica sus items por offsets absolutos (`iloc`), así que el tamaño total
+ * no cambia nunca. Si el layout no se puede parsear, passthrough sin tocar.
  */
 function stripHeic(bytes: Uint8Array, config: StripConfig, report: Reporter): Uint8Array {
   // Light sin bloques: passthrough de los mismos bytes (nada que limpiar).
   if (config.mode === 'light' && config.blocks.length === 0) return bytes.slice()
   const boxes = walkIsoBoxes(bytes)
   if (boxes.length === 0) return bytes.slice()
-  const wantExif = config.blocks.includes(BLOCK_EXIF)
-  const wantJunk = config.blocks.includes(BLOCK_JUNK)
-  const drop = (type: string): boolean => {
-    if (config.mode === 'deep') return HEIC_EXIF_TYPES.has(type) || HEIC_JUNK_TYPES.has(type)
-    return (wantExif && HEIC_EXIF_TYPES.has(type)) || (wantJunk && HEIC_JUNK_TYPES.has(type))
-  }
+  const wantExif = config.mode === 'deep' || config.blocks.includes(BLOCK_EXIF)
+  const wantJunk = config.mode === 'deep' || config.blocks.includes(BLOCK_JUNK)
+  if (!wantExif && !wantJunk) return bytes.slice()
+
+  const out = bytes.slice()
+  let changed = false
   report('Identificando cajas ISO-BMFF', 40)
-  let replaced = 0
-  const parts: Uint8Array[] = []
-  let cursor = 0
   for (const box of boxes) {
-    if (box.start > cursor) parts.push(bytes.slice(cursor, box.start))
-    if (drop(box.type)) {
-      replaced += 1
-      parts.push(freeBox(box.end - box.start))
-      cursor = box.end
-      continue
+    const dropExif = wantExif && HEIC_EXIF_TYPES.has(box.type)
+    const dropJunk = wantJunk && HEIC_JUNK_TYPES.has(box.type)
+    if (dropExif || dropJunk) {
+      out.set(freeBox(box.end - box.start), box.start)
+      changed = true
     }
-    parts.push(bytes.slice(box.start, box.end))
-    cursor = box.end
   }
-  if (cursor < bytes.length) parts.push(bytes.slice(cursor))
-  // Nada que quitar (o solo fase futura: item EXIF dentro de meta) → passthrough.
-  if (replaced === 0) return bytes.slice()
-  report('Eliminando cajas de metadata', 90)
-  return concat(parts)
+  if (wantExif) {
+    report('Localizando el item EXIF dentro de meta', 70)
+    if (zeroMetaExifPayload(out)) changed = true
+  }
+  // Nada que quitar (o layout no abordable) → passthrough de los mismos bytes.
+  if (!changed) return bytes.slice()
+  report('Eliminando metadata', 90)
+  return out
 }
 
 /* ── Dominio ── */
