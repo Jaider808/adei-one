@@ -197,19 +197,16 @@ export function insertPngIcc(bytes: Uint8Array, profile: Uint8Array): Uint8Array
   return concat([bytes.slice(0, ihdr.end), chunk, bytes.slice(ihdr.end)])
 }
 
-/** Re-inserta un perfil ICC en un WebP (chunk ICCP al inicio del contenedor). */
+/**
+ * Re-inserta un perfil ICC en un WebP respetando el orden que exige libwebp:
+ * `VP8X` SIEMPRE primero (cuando existe), el `ICCP` después de `VP8X` y antes
+ * de los píxeles. Si el WebP es simple (sin `VP8X`) los píxeles van primero, de
+ * modo que la metadata nunca queda como primer chunk. Re-escribe el tamaño RIFF.
+ */
 export function insertWebpIcc(bytes: Uint8Array, profile: Uint8Array): Uint8Array {
   if (profile.length === 0) return bytes.slice()
   if (bytes.length < 12 || asciiAt(bytes, 0) !== 'RIFF' || asciiAt(bytes, 8) !== 'WEBP') return bytes.slice()
-  const parts: Uint8Array[] = [asciiText('RIFF'), new Uint8Array(4), asciiText('WEBP')]
-  parts.push(webpChunkBytes('ICCP', profile))
-  for (const chunk of listWebpChunks(bytes)) {
-    if (chunk.fourcc === 'ICCP' || chunk.fourcc === 'EXIF' || chunk.fourcc === 'XMP ') continue
-    parts.push(webpChunkBytes(chunk.fourcc, chunk.data))
-  }
-  const out = concat(parts)
-  writeU32LE(out, 4, out.length - 8)
-  return out
+  return rebuildWebp(bytes, [{ fourcc: 'ICCP', data: profile }], new Set(['ICCP', 'EXIF', 'XMP ']))
 }
 
 /** Conserva el perfil ICC del ORIGINAL dentro del resultado limpio. */
@@ -684,6 +681,45 @@ export function listWebpChunks(bytes: Uint8Array): WebpChunk[] {
   return out
 }
 
+/**
+ * Reconstruye un contenedor WebP reubicando la metadata inyectada en el orden
+ * que exige libwebp, porque el decoder solo omite chunks opcionales cuando
+ * `VP8X` es el PRIMER chunk; si no, interpreta la metadata como bitstream y
+ * falla. Reglas:
+ * - `VP8X` (si existe) va SIEMPRE primero.
+ * - `ICCP` (perfil de color) va tras `VP8X` y antes de los píxeles.
+ * - El resto de la metadata (`EXIF`/`XMP `) va DESPUÉS de los datos de imagen.
+ * - Sin `VP8X` (WebP simple lossy/lossless) los píxeles van primero: la
+ *   metadata nunca queda como primer chunk.
+ * `drop` enumera los FourCC ya presentes que se descartan antes de reinyectar.
+ */
+function rebuildWebp(
+  bytes: Uint8Array,
+  metadata: WebpChunk[],
+  drop: ReadonlySet<string>,
+): Uint8Array {
+  const chunks = listWebpChunks(bytes)
+  const vp8x = chunks.find((c) => c.fourcc === 'VP8X')
+  const kept = chunks.filter((c) => c.fourcc !== 'VP8X' && !drop.has(c.fourcc))
+  const before = metadata.filter((m) => m.fourcc === 'ICCP')
+  const after = metadata.filter((m) => m.fourcc !== 'ICCP')
+  const parts: Uint8Array[] = [asciiText('RIFF'), new Uint8Array(4), asciiText('WEBP')]
+  if (vp8x) {
+    parts.push(webpChunkBytes(vp8x.fourcc, vp8x.data))
+    for (const chunk of before) parts.push(webpChunkBytes(chunk.fourcc, chunk.data))
+    for (const chunk of kept) parts.push(webpChunkBytes(chunk.fourcc, chunk.data))
+  } else {
+    // WebP simple (sin VP8X): los píxeles van primero para que la metadata
+    // nunca sea el primer chunk (el decoder leería los bytes como bitstream).
+    for (const chunk of kept) parts.push(webpChunkBytes(chunk.fourcc, chunk.data))
+    for (const chunk of before) parts.push(webpChunkBytes(chunk.fourcc, chunk.data))
+  }
+  for (const chunk of after) parts.push(webpChunkBytes(chunk.fourcc, chunk.data))
+  const out = concat(parts)
+  writeU32LE(out, 4, out.length - 8)
+  return out
+}
+
 /** FourCC WebP → bloque de metadata (o null). */
 function webpBlockOf(fourcc: string): string | null {
   switch (fourcc) {
@@ -758,6 +794,52 @@ export function stripWebpMetadataKeepingExif(
   const out = concat(parts)
   writeU32LE(out, 4, out.length - 8)
   return out
+}
+
+/* ── Re-inyección de orientación tras re-encodear (modo profundo) ── */
+
+/** Inserta un segmento APP1-EXIF tras el SOI de un JPEG. */
+function insertJpegExif(bytes: Uint8Array, payload: Uint8Array): Uint8Array {
+  if (bytes.length < 2 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return bytes.slice()
+  return concat([bytes.slice(0, 2), jpegSegmentBytes(0xe1, payload), bytes.slice(2)])
+}
+
+/** Inserta un chunk `eXIf` (TIFF crudo, sin prefijo) tras el IHDR de un PNG. */
+function insertPngExif(bytes: Uint8Array, tiff: Uint8Array): Uint8Array {
+  const ihdr = listPngChunks(bytes).find((c) => c.type === 'IHDR')
+  if (!ihdr) return bytes.slice()
+  return concat([bytes.slice(0, ihdr.end), pngChunkBytes('eXIf', tiff), bytes.slice(ihdr.end)])
+}
+
+/**
+ * Inserta un chunk `EXIF` (TIFF crudo) en un WebP respetando el orden que exige
+ * libwebp: `VP8X` primero (cuando existe) y el `EXIF` DESPUÉS de los datos de
+ * imagen. Sin `VP8X` los píxeles van primero, así la metadata nunca queda como
+ * primer chunk. Re-escribe el tamaño RIFF.
+ */
+function insertWebpExif(bytes: Uint8Array, tiff: Uint8Array): Uint8Array {
+  if (bytes.length < 12 || asciiAt(bytes, 0) !== 'RIFF' || asciiAt(bytes, 8) !== 'WEBP') return bytes.slice()
+  return rebuildWebp(bytes, [{ fourcc: 'EXIF', data: tiff }], new Set(['EXIF']))
+}
+
+/**
+ * Re-inyecta un EXIF mínimo con SOLO el tag `Orientation` en una imagen que ya
+ * fue re-codificada y limpiada (modo profundo). Así la foto se sigue viendo
+ * exactamente igual que antes aunque el canvas no haya rotado ningún píxel.
+ * Sin orientación (`undefined` o `1`) devuelve los bytes sin tocar. Es cirugía
+ * binaria pura (Node-testable): no usa canvas. El byte order del EXIF nuevo es
+ * little-endian (`II`), válido para cualquier visualizador.
+ */
+export function reinjectOrientation(
+  bytes: Uint8Array,
+  kind: 'jpg' | 'png' | 'webp',
+  orientation: number | undefined,
+): Uint8Array {
+  if (orientation === undefined || orientation <= 1) return bytes.slice()
+  const tiff = minimalOrientationTiff(orientation, 'II')
+  if (kind === 'jpg') return insertJpegExif(bytes, concat([asciiText(EXIF_PREFIX), tiff]))
+  if (kind === 'png') return insertPngExif(bytes, tiff)
+  return insertWebpExif(bytes, tiff)
 }
 
 /* ── ISO-BMFF: re-escritura de offsets (remux lossless) ── */

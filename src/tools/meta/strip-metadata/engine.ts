@@ -52,6 +52,7 @@ import {
   preserveIcc,
   readU16BE,
   readU32BE,
+  reinjectOrientation,
   stripJpegAllSegments,
   stripJpegMetadata,
   stripJpegMetadataKeepingExif,
@@ -684,6 +685,17 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * ¿El valor de `Orientation` del inventario estructurado corresponde a una
+ * orientación que el modo ligero conserva? `exifr` traduce el tag a texto
+ * (`"Rotate 90 CW"`…), y solo el valor 1 (`"Horizontal (normal)"`) se elimina
+ * junto con el resto del EXIF. Se acepta también el valor numérico crudo.
+ */
+function orientationValueIsPreserved(value: unknown): boolean {
+  if (value === 1 || value === '1') return false
+  return value !== 'Horizontal (normal)'
+}
+
+/**
  * Enumera el resultado estructurado de exifr: cada campo de cada IFD (IFD0,
  * SubIFD, GPS, Interop, IFD1) y cada propiedad XMP, con su ruta real. Las
  * claves desconocidas se listan con su clave cruda (nunca se descartan).
@@ -717,20 +729,23 @@ function pushStructuredExifEntries(meta: Record<string, unknown>, entries: MetaE
       const binary = value instanceof Uint8Array
       // IPTC no lo elimina la cirugía ligera (JPEG APP13 no se clasifica): se conserva.
       const technical = blockKey === 'iptc'
-      // La orientación de IFD0 se CONSERVA en el modo ligero (por defecto): se
-      // sustituye el EXIF por uno mínimo con solo este tag para no girar la foto
-      // sin degradarla. Se marca como "se conserva" y se explica el porqué.
+      // La orientación de IFD0 se CONSERVA en el modo ligero SOLO cuando su
+      // valor es > 1 (fotos giradas): se sustituye el EXIF por uno mínimo con
+      // solo este tag para no girar la foto sin degradarla. Cuando vale 1
+      // ("Horizontal (normal)") el modo ligero elimina el tag igual que el
+      // resto del EXIF, así que NO se marca como conservado para no mentir.
       const orientation = blockKey === 'ifd0' && key === 'Orientation'
+      const preservedOrientation = orientation && orientationValueIsPreserved(value)
       entries.push({
         where,
         key,
-        label: orientation
+        label: preservedOrientation
           ? 'Orientación (se conserva para no girar la foto sin perder calidad)'
           : mapped?.label,
         value: binary ? '' : txt(exifValue(key, value)),
         ...(binary ? { size: value.length, hex: shortHex(value) } : {}),
         sensitivity: mapped?.sensitivity ?? (key.startsWith('GPS') ? 'high' : 'medium'),
-        removal: technical || orientation ? 'never' : 'with-container',
+        removal: technical || preservedOrientation ? 'never' : 'with-container',
       })
     }
   }
@@ -971,10 +986,10 @@ async function scanBaseImage(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'): P
     const orientation = await readOrientation(bytes, kind)
     if (orientation !== undefined && orientation > 1) {
       risks.push({
-        id: 'image-orientation',
-        label: 'Orientación EXIF',
+        id: 'image-reencode',
+        label: 'Re-codificación de la imagen',
         detail:
-          'Al permitir modificar el archivo, la imagen se endereza rotando los píxeles y se elimina su orientación: se pierde calidad. El modo ligero la conserva tal cual.',
+          'Al permitir modificar el archivo, la imagen se re-codifica (puede perder algo de calidad) y se elimina toda la metadata residual; la orientación se conserva. El modo ligero no re-codifica.',
         severity: 'medium',
         affects: 'deep',
       })
@@ -1392,51 +1407,25 @@ async function readOrientation(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'):
 }
 
 /**
- * Devuelve un canvas con la EXIF Orientation APLICADA a los píxeles (gracias a
- * esto, al borrar el tag la foto no se gira: es el mismo criterio que mat2/
- * GdkPixbuf `apply_embedded_orientation`). Orientación 1 = sin cambios.
- */
-async function buildOrientedCanvas(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'): Promise<HTMLCanvasElement> {
-  const orientation = await readOrientation(bytes, kind)
-  const { canvas } = await decodeToCanvas(bytes)
-  if (!orientation || orientation === 1) return canvas
-  const swap = orientation >= 5 && orientation <= 8
-  const out = document.createElement('canvas')
-  out.width = swap ? canvas.height : canvas.width
-  out.height = swap ? canvas.width : canvas.height
-  const ctx = out.getContext('2d')
-  if (!ctx) throw new Error('No se pudo preparar el lienzo')
-  ctx.translate(Math.round(out.width / 2), Math.round(out.height / 2))
-  const matrix: Record<number, [number, number, number, number]> = {
-    2: [-1, 0, 0, 1],
-    3: [-1, 0, 0, -1],
-    4: [1, 0, 0, -1],
-    5: [0, 1, 1, 0],
-    6: [0, 1, -1, 0],
-    7: [0, -1, -1, 0],
-    8: [0, -1, 1, 0],
-  }
-  const t = matrix[orientation] ?? [1, 0, 0, 1]
-  ctx.transform(t[0], t[1], t[2], t[3], 0, 0)
-  ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2)
-  return out
-}
-
-/**
- * Re-encode por canvas con orientación aplicada (deep): se vuelve a comprimir,
- * se endereza la foto si hace falta y se elimina TODO rastro. Los encoders del
- * navegador inyectan su propia metadata (APP0-JFIF, sRGB/gAMA) → se limpia.
- * El perfil ICC (dato "importante") se conserva del original.
+ * Re-encode por canvas (deep): se vuelve a comprimir y se elimina TODO rastro
+ * (incluida la metadata que inyectan los encoders del navegador: APP0-JFIF,
+ * sRGB/gAMA…). NO rota la imagen: los píxeles se decodifican TAL CUAL están
+ * almacenados (`imageOrientation:'none'`) y, tras limpiar, se re-inyecta un
+ * EXIF mínimo con el `Orientation` ORIGINAL, de modo que la foto se sigue
+ * viendo exactamente igual que antes sin alterar la rotación. El perfil ICC
+ * (dato "importante") se conserva del original.
  */
 async function deepCleanImage(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'): Promise<Uint8Array> {
-  const canvas = await buildOrientedCanvas(bytes, kind)
+  const orientation = await readOrientation(bytes, kind)
+  const { canvas } = await decodeToCanvas(bytes, { imageOrientation: 'none' })
   const mime = kind === 'jpg' ? 'image/jpeg' : kind === 'png' ? 'image/png' : 'image/webp'
   let out = await canvasToBytes(canvas, mime, qualityFor(kind))
   canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
   if (kind === 'jpg') out = stripJpegAllSegments(out)
   else if (kind === 'png') out = stripPngDeep(out)
   else out = stripWebpMetadata(out)
-  return preserveIcc(bytes, kind, out)
+  out = preserveIcc(bytes, kind, out)
+  return reinjectOrientation(out, kind, orientation)
 }
 
 /** Cirugía lossless de un conjunto de bloques (compartida por light). */

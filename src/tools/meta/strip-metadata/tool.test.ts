@@ -11,9 +11,24 @@ import { describe, expect, it, vi } from 'vitest'
 import { PDFDict, PDFDocument, PDFName, PDFString } from 'pdf-lib'
 import { strToU8, unzipSync, zipSync } from 'fflate'
 import { ResultPanel } from '@/components/workflow/ResultPanel'
+import { canvasToBytes, decodeToCanvas } from '@/tools/image/shared'
 import { scanMetadata, stripMetadata } from './engine'
 import { imagePlusDomain } from './image-plus'
 import type { Artifact, EngineInput, FileKind, VerificationResult } from '@/core/types'
+
+/*
+ * El re-encode profundo de imagen usa canvas (solo navegador). Se envuelven los
+ * helpers en spies que DELEGAN en la implementación real por defecto: así las
+ * guardas de navegador siguen lanzando y un test puede fijar su propio mock.
+ */
+vi.mock('@/tools/image/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/tools/image/shared')>()
+  return {
+    ...actual,
+    decodeToCanvas: vi.fn(actual.decodeToCanvas),
+    canvasToBytes: vi.fn(actual.canvasToBytes),
+  }
+})
 
 function eng(bytes: Uint8Array, name: string, kind: FileKind, config: Record<string, unknown> = {}): EngineInput {
   return { bytes, name, kind, config }
@@ -186,6 +201,23 @@ function jpgOrientationBytes(): Uint8Array {
     ascii('II'), u16le(0x2a), u32leBytes(8), // cabecera TIFF → IFD0 en 8
     u16le(1), // 1 entrada
     u16le(0x0112), u16le(3), u32leBytes(1), u32leBytes(6), // Orientation = SHORT → 6
+    u32leBytes(0), // siguiente IFD: ninguno
+  ])
+  const payload = concat([ascii('Exif'), Uint8Array.of(0, 0), tiff])
+  return concat([
+    Uint8Array.of(0xff, 0xd8),
+    Uint8Array.of(0xff, 0xe1), u16be(2 + payload.length), payload,
+    Uint8Array.of(0xff, 0xdb), ascii('KEED'),
+    Uint8Array.of(0xff, 0xd9),
+  ])
+}
+
+/** JPEG con EXIF real (TIFF LE) con Orientation = 1 ("Horizontal (normal)"). */
+function jpgNormalOrientationBytes(): Uint8Array {
+  const tiff = concat([
+    ascii('II'), u16le(0x2a), u32leBytes(8), // cabecera TIFF → IFD0 en 8
+    u16le(1), // 1 entrada
+    u16le(0x0112), u16le(3), u32leBytes(1), u32leBytes(1), // Orientation = SHORT → 1
     u32leBytes(0), // siguiente IFD: ninguno
   ])
   const payload = concat([ascii('Exif'), Uint8Array.of(0, 0), tiff])
@@ -609,6 +641,25 @@ describe('stripMetadata — deep (guardas de navegador)', () => {
     ).rejects.toThrow(/navegador/i)
   })
 
+  it('JPG deep: decodifica los píxeles TAL CUAL (imageOrientation "none", sin rotar)', async () => {
+    const fakeCanvas = {
+      width: 4,
+      height: 4,
+      getContext: () => ({ clearRect: vi.fn() }),
+    } as unknown as HTMLCanvasElement
+    const decode = vi.mocked(decodeToCanvas)
+    const encode = vi.mocked(canvasToBytes)
+    decode.mockResolvedValueOnce({ canvas: fakeCanvas, width: 4, height: 4 })
+    encode.mockResolvedValueOnce(new Uint8Array([1, 2, 3]))
+
+    await stripMetadata(eng(jpgExifBytes(), 'foto.jpg', 'jpg', { mode: 'deep' }))
+
+    // Debe pedir los píxeles CRUDOS: sin esta opción el canvas los enderezaría
+    // y el re-encode cambiaría la rotación (regresión del cambio "deep no cambia
+    // la rotación"). El test falla si se elimina la opción.
+    expect(decode).toHaveBeenCalledWith(expect.any(Uint8Array), { imageOrientation: 'none' })
+  })
+
   it('PDF deep → requiere navegador (rasterizado)', async () => {
     await expect(
       stripMetadata(eng(await pdfBytes(), 'x.pdf', 'pdf', { mode: 'deep' })),
@@ -716,12 +767,19 @@ describe('scanMetadata — avisos de regeneración (risks)', () => {
     expect(risk?.affects).toBe('deep')
   })
 
-  it('Imagen con Orientation > 1: el aviso es del modo con switch (deep), no de light', async () => {
+  it('Imagen con Orientation > 1: el aviso habla de re-codificación y NO de perder la orientación', async () => {
     const report = await scanMetadata({ bytes: jpgOrientationBytes(), kind: 'jpg' })
-    const risk = report.risks?.find((r) => r.id === 'image-orientation')
+    const risk = report.risks?.find((r) => r.id === 'image-reencode')
     expect(risk).toBeDefined()
     expect(risk?.affects).toBe('deep')
-    expect(risk?.detail).toMatch(/rotando los píxeles/i)
+    // El aviso ya NO miente: no describe una rotación ni una pérdida de orientación.
+    expect(risk?.detail).not.toMatch(/rotando los píxeles/i)
+    expect(risk?.detail).not.toMatch(/se elimina su orientación/i)
+    // Sí avisa de la re-codificación (pérdida de calidad) y de que la orientación se conserva.
+    expect(risk?.detail).toMatch(/re-codific/i)
+    expect(risk?.detail).toMatch(/orientación se conserva/i)
+    // El identificador antiguo ya no existe.
+    expect(report.risks?.some((r) => r.id === 'image-orientation') ?? false).toBe(false)
   })
 })
 
@@ -732,6 +790,16 @@ describe('scanMetadata — orientación conservada (honestidad)', () => {
     expect(entry).toBeDefined()
     expect(entry?.removal).toBe('never')
     expect(entry?.label ?? '').toMatch(/conserva/i)
+  })
+
+  it('orientación 1 (normal): NO se marca como conservada (el modo ligero la elimina)', async () => {
+    const report = await scanMetadata({ bytes: jpgNormalOrientationBytes(), kind: 'jpg' })
+    const entry = report.entries.find((e) => e.key === 'Orientation')
+    expect(entry).toBeDefined()
+    // El modo ligero solo conserva la orientación cuando es > 1; con 1 el tag
+    // se elimina junto al resto del EXIF: la etiqueta debe ser honesta.
+    expect(entry?.removal).toBe('with-container')
+    expect(entry?.label ?? '').not.toMatch(/conserva/i)
   })
 })
 

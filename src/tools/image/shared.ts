@@ -84,15 +84,35 @@ export function clampCrop(
 }
 
 /* ── Canvas (solo navegador) ── */
-/** Decodifica bytes de imagen a un canvas (drawImage). Lanza si no hay navegador. */
+
+/** Opciones de decodificación de `decodeToCanvas` (todas opcionales). */
+export interface DecodeOptions {
+  /**
+   * Cómo trata `createImageBitmap` la orientación EXIF: `'none'` devuelve los
+   * píxeles TAL CUAL están almacenados; `'from-image'` los endereza según el
+   * tag. Si se omite, se usa el comportamiento por defecto del navegador
+   * (que hoy es `'from-image'`), idéntico al de siempre.
+   */
+  imageOrientation?: 'none' | 'from-image'
+}
+
+/**
+ * Decodifica bytes de imagen a un canvas (drawImage). Lanza si no hay navegador.
+ * `opts` es opcional: sin él el comportamiento es EXACTAMENTE el de siempre
+ * (las tools de imagen lo llaman así); con `opts.imageOrientation` se pasa a
+ * `createImageBitmap` para controlar la orientación EXIF de forma explícita.
+ */
 export async function decodeToCanvas(
   bytes: Uint8Array,
+  opts?: DecodeOptions,
 ): Promise<{ canvas: HTMLCanvasElement; width: number; height: number }> {
   assertBrowser()
   const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], {
     type: 'application/octet-stream',
   })
-  const source = await createImageBitmap(blob)
+  const source = opts?.imageOrientation
+    ? await createImageBitmap(blob, { imageOrientation: opts.imageOrientation })
+    : await createImageBitmap(blob)
   const canvas = document.createElement('canvas')
   canvas.width = source.width
   canvas.height = source.height

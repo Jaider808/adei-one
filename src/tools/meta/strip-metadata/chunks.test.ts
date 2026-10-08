@@ -13,6 +13,7 @@ import {
   concat,
   extractIcc,
   insertJpegIcc,
+  insertWebpIcc,
   listJpegCom,
   listPngChunks,
   listPngText,
@@ -22,6 +23,7 @@ import {
   patchMp4Stco,
   readU16BE,
   readU32BE,
+  reinjectOrientation,
   stripJpegAllSegments,
   stripJpegMetadata,
   stripJpegMetadataKeepingExif,
@@ -378,6 +380,36 @@ describe('perfil ICC JPEG', () => {
   })
 })
 
+describe('perfil ICC WebP', () => {
+  const PROFILE = ascii('PROFILE-BYTES-1234')
+
+  it('insertWebpIcc pone VP8X primero y el ICCP antes de los píxeles', () => {
+    const cleaned = concat([
+      ascii('RIFF'), u32le(0), ascii('WEBP'),
+      webpChunk('VP8X', ascii('EXTENDED')),
+      webpChunk('VP8 ', ascii('FRAMEDATA')),
+    ])
+    const out = insertWebpIcc(cleaned, PROFILE)
+    const chunks = listWebpChunks(out)
+    // libwebp solo omite chunks opcionales si VP8X es el PRIMER chunk; el ICCP
+    // (perfil de color) va después de VP8X y antes de los datos de imagen.
+    expect(chunks.map((c) => c.fourcc)).toEqual(['VP8X', 'ICCP', 'VP8 '])
+    expect(chunks.find((c) => c.fourcc === 'ICCP')?.data).toEqual(PROFILE)
+    expect(le32(out, 4)).toBe(out.length - 8)
+    expect(extractIcc(out, 'webp')).toEqual(PROFILE)
+  })
+
+  it('WebP simple sin VP8X: el ICCP nunca queda como primer chunk', () => {
+    const cleaned = concat([ascii('RIFF'), u32le(0), ascii('WEBP'), webpChunk('VP8L', ascii('LOSSLESSDATA'))])
+    const out = insertWebpIcc(cleaned, PROFILE)
+    const chunks = listWebpChunks(out)
+    expect(chunks.map((c) => c.fourcc)).toEqual(['VP8L', 'ICCP'])
+    expect(chunks[0].fourcc).not.toBe('ICCP')
+    expect(le32(out, 4)).toBe(out.length - 8)
+    expect(extractIcc(out, 'webp')).toEqual(PROFILE)
+  })
+})
+
 /* ── EXIF mínimo (orientación conservada sin re-codificar) ── */
 
 /** TIFF de referencia: byte order + magic 42 + IFD0 en 8 + una entrada Orientation. */
@@ -490,5 +522,97 @@ describe('stripPngMetadataKeepingExif', () => {
     expect(textOf(out)).not.toContain('GPS')
     // El CRC del chunk reescrito debe ser correcto (listPngChunks lo relee).
     expect(listPngChunks(out).map((c) => c.type)).toEqual(['IHDR', 'IDAT', 'eXIf', 'tEXt', 'IEND'])
+  })
+})
+
+/* ── Re-inyección de orientación tras re-encodear (deep) ── */
+
+describe('reinjectOrientation', () => {
+  it('sin orientación (undefined o 1) devuelve los bytes sin tocar', () => {
+    expect(reinjectOrientation(JPG_SPEC, 'jpg', undefined)).toEqual(JPG_SPEC)
+    expect(reinjectOrientation(JPG_SPEC, 'jpg', 1)).toEqual(JPG_SPEC)
+  })
+
+  it('JPEG sin EXIF: añade un APP1 mínimo con solo Orientation y no toca el resto', async () => {
+    const jpeg = concat([
+      Uint8Array.of(0xff, 0xd8),
+      Uint8Array.of(0xff, 0xdb), u16be(2 + 4), ascii('KEED'),
+      Uint8Array.of(0xff, 0xd9),
+    ])
+    const out = reinjectOrientation(jpeg, 'jpg', 6)
+
+    // Cabecera EXIF mínima justo tras el SOI.
+    expect(out[0]).toBe(0xff)
+    expect(out[1]).toBe(0xd8)
+    expect(out[2]).toBe(0xff)
+    expect(out[3]).toBe(0xe1)
+    // El payload del APP1 (tras marcador y longitud) empieza con 'Exif\0\0'.
+    expect(textOf(out.slice(6, 12))).toBe('Exif\x00\x00')
+
+    // El resto del archivo queda byte a byte idéntico (solo se insertó el APP1).
+    const injectedLen = out.length - jpeg.length
+    expect(injectedLen).toBeGreaterThan(0)
+    expect(concat([out.slice(0, 2), out.slice(2 + injectedLen)])).toEqual(jpeg)
+
+    // Se relee el único tag Orientation, con su valor.
+    const exifr = await import('exifr')
+    const parsed = (await exifr.parse(out, { translateValues: false })) as Record<string, unknown> | undefined
+    expect(parsed?.['Orientation']).toBe(6)
+    expect(parsed?.['Make']).toBeUndefined()
+  })
+
+  it('PNG sin EXIF: añade un chunk eXIf mínimo tras IHDR y conserva IDAT/IEND', async () => {
+    const png = concat([
+      Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+      pngChunk('IHDR', new Uint8Array(13)),
+      pngChunk('IDAT', ascii('PIXELES')),
+      pngChunk('IEND', new Uint8Array()),
+    ])
+    const out = reinjectOrientation(png, 'png', 8)
+
+    const chunks = listPngChunks(out)
+    expect(chunks.map((c) => c.type)).toEqual(['IHDR', 'eXIf', 'IDAT', 'IEND'])
+    expect(chunks.find((c) => c.type === 'IDAT')?.data).toEqual(ascii('PIXELES'))
+
+    const exifr = await import('exifr')
+    const parsed = (await exifr.parse(out, { translateValues: false })) as Record<string, unknown> | undefined
+    expect(parsed?.['Orientation']).toBe(8)
+  })
+
+  it('WebP simple sin VP8X: los píxeles van primero y el EXIF después (decodificable)', async () => {
+    const webp = concat([ascii('RIFF'), u32le(0), ascii('WEBP'), webpChunk('VP8 ', ascii('FRAMEDATA'))])
+    const out = reinjectOrientation(webp, 'webp', 6)
+
+    expect(textOf(out)).toContain('VP8 ')
+    expect(textOf(out)).toContain('FRAMEDATA')
+    const chunks = listWebpChunks(out)
+    // libwebp solo omite chunks opcionales si VP8X es el PRIMER chunk; sin VP8X
+    // los píxeles deben ir primero o el decoder trata el EXIF como bitstream.
+    expect(chunks.map((c) => c.fourcc)).toEqual(['VP8 ', 'EXIF'])
+    expect(chunks[0].fourcc).not.toBe('EXIF')
+    expect(le32(out, 4)).toBe(out.length - 8)
+
+    const exifr = await import('exifr')
+    const exifChunk = chunks.find((c) => c.fourcc === 'EXIF')!
+    const parsed = (await exifr.parse(exifChunk.data, { translateValues: false })) as Record<string, unknown> | undefined
+    expect(parsed?.['Orientation']).toBe(6)
+  })
+
+  it('WebP con VP8X: VP8X primero y el EXIF después de los datos de imagen', async () => {
+    const webp = concat([
+      ascii('RIFF'), u32le(0), ascii('WEBP'),
+      webpChunk('VP8X', ascii('EXTENDED')),
+      webpChunk('VP8 ', ascii('FRAMEDATA')),
+    ])
+    const out = reinjectOrientation(webp, 'webp', 8)
+
+    const chunks = listWebpChunks(out)
+    expect(chunks.map((c) => c.fourcc)).toEqual(['VP8X', 'VP8 ', 'EXIF'])
+    expect(chunks[0].fourcc).toBe('VP8X')
+    expect(le32(out, 4)).toBe(out.length - 8)
+
+    const exifr = await import('exifr')
+    const parsed = (await exifr.parse(chunks[chunks.length - 1].data, { translateValues: false })) as Record<string, unknown> | undefined
+    expect(parsed?.['Orientation']).toBe(8)
   })
 })
