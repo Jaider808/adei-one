@@ -48,17 +48,24 @@ import {
   listPngChunks,
   listPngText,
   listWebpChunks,
+  minimalOrientationExif,
   preserveIcc,
   readU16BE,
   readU32BE,
   stripJpegAllSegments,
   stripJpegMetadata,
+  stripJpegMetadataKeepingExif,
   stripPngDeep,
   stripPngMetadata,
+  stripPngMetadataKeepingExif,
   stripWebpMetadata,
+  stripWebpMetadataKeepingExif,
 } from './chunks'
 import { EMPTY_REPORT, makeReporter, shortHex } from './domain'
+import { epubDomain } from './epub'
 import { imagePlusDomain } from './image-plus'
+import { odfDomain } from './odf'
+import { svgDomain } from './svg'
 import { videoDomain } from './video'
 import type { Reporter, StripConfig } from './domain'
 import type {
@@ -710,14 +717,20 @@ function pushStructuredExifEntries(meta: Record<string, unknown>, entries: MetaE
       const binary = value instanceof Uint8Array
       // IPTC no lo elimina la cirugía ligera (JPEG APP13 no se clasifica): se conserva.
       const technical = blockKey === 'iptc'
+      // La orientación de IFD0 se CONSERVA en el modo ligero (por defecto): se
+      // sustituye el EXIF por uno mínimo con solo este tag para no girar la foto
+      // sin degradarla. Se marca como "se conserva" y se explica el porqué.
+      const orientation = blockKey === 'ifd0' && key === 'Orientation'
       entries.push({
         where,
         key,
-        label: mapped?.label,
+        label: orientation
+          ? 'Orientación (se conserva para no girar la foto sin perder calidad)'
+          : mapped?.label,
         value: binary ? '' : txt(exifValue(key, value)),
         ...(binary ? { size: value.length, hex: shortHex(value) } : {}),
         sensitivity: mapped?.sensitivity ?? (key.startsWith('GPS') ? 'high' : 'medium'),
-        removal: technical ? 'never' : 'with-container',
+        removal: technical || orientation ? 'never' : 'with-container',
       })
     }
   }
@@ -960,9 +973,10 @@ async function scanBaseImage(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'): P
       risks.push({
         id: 'image-orientation',
         label: 'Orientación EXIF',
-        detail: 'El modo ligero re-codifica la imagen para enderezarla según su orientación EXIF: se pierde calidad.',
+        detail:
+          'Al permitir modificar el archivo, la imagen se endereza rotando los píxeles y se elimina su orientación: se pierde calidad. El modo ligero la conserva tal cual.',
         severity: 'medium',
-        affects: 'light',
+        affects: 'deep',
       })
     }
   } catch {
@@ -1183,11 +1197,14 @@ async function scanMd(bytes: Uint8Array): Promise<MetadataReport> {
   }
 }
 
-/** Encuentra el dominio (audio/video/imagen-extra) de un kind, o null. */
+/** Encuentra el dominio (audio/video/imagen-extra/svg) de un kind, o null. */
 function domainOf(kind: FileKind) {
   if (audioDomain.kinds.includes(kind)) return audioDomain
   if (videoDomain.kinds.includes(kind)) return videoDomain
   if (imagePlusDomain.kinds.includes(kind)) return imagePlusDomain
+  if (svgDomain.kinds.includes(kind)) return svgDomain
+  if (odfDomain.kinds.includes(kind)) return odfDomain
+  if (epubDomain.kinds.includes(kind)) return epubDomain
   return null
 }
 
@@ -1432,11 +1449,46 @@ function stripImageBlocks(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp', block
       : stripJpegMetadata(bytes, blocks)
 }
 
+/** Datos EXIF crudos de la imagen (JPEG APP1, WebP EXIF, PNG eXIf), o null. */
+function rawExifData(bytes: Uint8Array, kind: 'jpg' | 'png' | 'webp'): Uint8Array | null {
+  if (kind === 'jpg') {
+    const segment = findJpegSegments(bytes).find(
+      (s) => s.marker === 0xe1 && String.fromCharCode(...s.payload.slice(0, 6)) === 'Exif\x00\x00',
+    )
+    return segment ? segment.payload : null
+  }
+  if (kind === 'webp') {
+    const chunk = listWebpChunks(bytes).find((c) => c.fourcc === 'EXIF')
+    return chunk ? chunk.data : null
+  }
+  const chunk = listPngChunks(bytes).find((c) => c.type === 'eXIf')
+  return chunk ? chunk.data : null
+}
+
+/**
+ * Cirugía lossless conservando la orientación: en vez de eliminar el EXIF
+ * entero, lo reduce a un EXIF mínimo con SOLO el tag Orientation (mismo byte
+ * order). No hay canvas ni re-encode: los píxeles quedan intactos.
+ */
+function stripImageBlocksKeepingOrientation(
+  bytes: Uint8Array,
+  kind: 'jpg' | 'png' | 'webp',
+  blockIds: string[],
+  minimalExif: Uint8Array | null,
+): Uint8Array {
+  const blocks = new Set(blockIds)
+  return kind === 'png'
+    ? stripPngMetadataKeepingExif(bytes, blocks, minimalExif)
+    : kind === 'webp'
+      ? stripWebpMetadataKeepingExif(bytes, blocks, minimalExif)
+      : stripJpegMetadataKeepingExif(bytes, blocks, minimalExif)
+}
+
 /* ── Strip: restos (passthrough) ── */
 
 /** Formatos sin metadata estándar → passthrough de los mismos bytes. */
 const PLAIN_KINDS: ReadonlySet<FileKind> = new Set([
-  'txt', 'csv', 'xml', 'json', 'html', 'yaml', 'toml', 'zip', 'epub', 'rtf', 'odt', 'svg', 'adei',
+  'txt', 'csv', 'xml', 'json', 'html', 'yaml', 'toml', 'zip', 'rtf', 'adei',
 ])
 
 /* ── Engine ── */
@@ -1487,12 +1539,14 @@ export async function stripMetadata(
         bytes = input.bytes.slice()
       } else {
         const orientation = await readOrientation(input.bytes, kind)
-        if (orientation !== undefined && orientation > 1) {
-          // Foto con orientación EXIF (típico de móvil tomada en vertical):
-          // se enderezan los píxeles y luego se limpia, para que la foto NO se
-          // gire al eliminar el tag (mismo criterio que mat2).
-          const oriented = await deepCleanImage(input.bytes, kind)
-          bytes = stripImageBlocks(oriented, kind, config.blocks)
+        if (orientation !== undefined && orientation > 1 && config.blocks.includes(BLOCK_EXIF)) {
+          // Foto con orientación EXIF (típico de móvil tomada en vertical): el
+          // modo ligero es NO destructivo. En vez de re-codificar y rotar los
+          // píxeles, se sustituye el EXIF por uno mínimo que conserva SOLO el
+          // tag Orientation: la foto se ve derecha y nada se degrada.
+          const originalExif = rawExifData(input.bytes, kind)
+          const minimalExif = originalExif ? minimalOrientationExif(originalExif, orientation) : null
+          bytes = stripImageBlocksKeepingOrientation(input.bytes, kind, config.blocks, minimalExif)
         } else {
           bytes = stripImageBlocks(input.bytes, kind, config.blocks)
         }

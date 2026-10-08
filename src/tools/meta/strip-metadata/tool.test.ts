@@ -197,6 +197,40 @@ function jpgOrientationBytes(): Uint8Array {
   ])
 }
 
+/** Posición del marcador SOS (FF DA): a partir de ahí van los datos de imagen. */
+function sosIndex(bytes: Uint8Array): number {
+  for (let i = 0; i + 1 < bytes.length; i++) {
+    if (bytes[i] === 0xff && bytes[i + 1] === 0xda) return i
+  }
+  return -1
+}
+
+/**
+ * JPEG con EXIF real (TIFF LE) con Make + Orientation = 6, y datos de imagen
+ * (DQT + SOS + scan). Permite comprobar que en light NO se re-codifican píxeles.
+ */
+function jpgOrientationScanBytes(): Uint8Array {
+  const make = ascii('NIKON\0')
+  const ifd = concat([
+    u16le(2), // 2 entradas
+    Uint8Array.from([0x0f, 0x01, 0x02, 0x00]), u32leBytes(make.length), u32leBytes(38), // Make → 38
+    Uint8Array.from([0x12, 0x01, 0x03, 0x00]), u32leBytes(1), u32leBytes(6), // Orientation = SHORT → 6
+    u32leBytes(0), // siguiente IFD: ninguno
+  ])
+  // IFD0 en 8: 2 + 2*12 + 4 = 30 → termina en 38. Make en 38.
+  const tiff = concat([ascii('II'), u16le(0x2a), u32leBytes(8), ifd, make])
+  const payload = concat([ascii('Exif'), Uint8Array.of(0, 0), tiff])
+  const sos = concat([Uint8Array.of(0xff, 0xda), u16be(2 + 2), Uint8Array.of(0x01, 0x01)])
+  return concat([
+    Uint8Array.of(0xff, 0xd8),
+    Uint8Array.of(0xff, 0xe1), u16be(2 + payload.length), payload,
+    Uint8Array.of(0xff, 0xdb), u16be(2 + 4), ascii('KEED'),
+    sos,
+    ascii('SCANDATA-PIXELES'),
+    Uint8Array.of(0xff, 0xd9),
+  ])
+}
+
 /** JPEG con EXIF real (TIFF LE) que incluye un tag privado no mapeado (0x9999). */
 function jpgPrivateExifBytes(): Uint8Array {
   const make = ascii('NIKON\0')
@@ -505,11 +539,40 @@ describe('stripMetadata — light lossless', () => {
     expect(txt).toContain('KEED')
   })
 
-  it('JPG con orientación EXIF (vertical): en light se re-procesa para no girar', async () => {
-    // La foto "vertical" (Orientation=6) debe re-orientarse → requiere navegador.
-    await expect(
-      stripMetadata(eng(jpgOrientationBytes(), 'vertical.jpg', 'jpg', { mode: 'light', blocks: ['exif'] })),
-    ).rejects.toThrow(/navegador/i)
+  it('JPG con orientación EXIF (vertical): en light conserva el tag y NO toca los píxeles', async () => {
+    const source = jpgOrientationScanBytes()
+    const result = await stripMetadata(eng(source, 'vertical.jpg', 'jpg', { mode: 'light', blocks: ['exif'] }))
+    const out = await bytesOf(result)
+
+    // (a) Los datos de imagen tras SOS quedan byte a byte idénticos: no hubo re-encode.
+    const from = sosIndex(source)
+    expect(from).toBeGreaterThan(0)
+    expect(out.slice(sosIndex(out))).toEqual(source.slice(from))
+
+    // (b) Sigue siendo un JPEG válido y conserva las cabeceras no metadatos.
+    expect(out[0]).toBe(0xff)
+    expect(out[1]).toBe(0xd8)
+    expect(out[out.length - 1]).toBe(0xd9)
+    expect(new TextDecoder().decode(out)).toContain('KEED')
+
+    // (c) El EXIF queda reducido al único tag Orientation, con su valor original.
+    const exifr = await import('exifr')
+    const parsed = (await exifr.parse(out, { translateValues: false })) as Record<string, unknown> | undefined
+    expect(parsed?.['Orientation']).toBe(6)
+
+    // (d) El resto del EXIF (Make) desaparece del inventario.
+    const report = await scanMetadata({ bytes: out, kind: 'jpg' })
+    expect(report.entries.some((e) => e.key === 'Make')).toBe(false)
+  })
+
+  it('JPG sin orientación: el EXIF se elimina entero (comportamiento sin cambios)', async () => {
+    const result = await stripMetadata(eng(jpgExifBytes(), 'foto.jpg', 'jpg', { mode: 'light', blocks: ['exif'] }))
+    const out = await bytesOf(result)
+    const txt = new TextDecoder().decode(out)
+    expect(txt).not.toContain('CAMERAX')
+    expect(txt).toContain('KEED')
+    // Sin orientación no se conserva ningún EXIF.
+    expect(txt).not.toContain('Exif')
   })
 
   it('scan JPG: el perfil ICC se marca como "se conserva" (never)', async () => {
@@ -653,11 +716,22 @@ describe('scanMetadata — avisos de regeneración (risks)', () => {
     expect(risk?.affects).toBe('deep')
   })
 
-  it('Imagen con Orientation > 1: avisa de que ligero la re-codifica', async () => {
+  it('Imagen con Orientation > 1: el aviso es del modo con switch (deep), no de light', async () => {
     const report = await scanMetadata({ bytes: jpgOrientationBytes(), kind: 'jpg' })
     const risk = report.risks?.find((r) => r.id === 'image-orientation')
     expect(risk).toBeDefined()
-    expect(risk?.affects).toBe('light')
+    expect(risk?.affects).toBe('deep')
+    expect(risk?.detail).toMatch(/rotando los píxeles/i)
+  })
+})
+
+describe('scanMetadata — orientación conservada (honestidad)', () => {
+  it('marca la orientación como "se conserva" (never) y explica por qué', async () => {
+    const report = await scanMetadata({ bytes: jpgOrientationScanBytes(), kind: 'jpg' })
+    const entry = report.entries.find((e) => e.key === 'Orientation')
+    expect(entry).toBeDefined()
+    expect(entry?.removal).toBe('never')
+    expect(entry?.label ?? '').toMatch(/conserva/i)
   })
 })
 

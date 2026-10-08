@@ -1,9 +1,9 @@
 /** @vitest-environment happy-dom */
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MetaStripView } from './view'
 import { stripMetadataTool } from './tool'
-import type { Artifact, MetadataReport, RegenerationRisk } from '@/core/types'
+import type { Artifact, MetaEntry, MetadataReport, RegenerationRisk } from '@/core/types'
 
 const engineMock = vi.hoisted(() => ({ scanMetadata: vi.fn() }))
 
@@ -273,7 +273,7 @@ describe('<MetaStripView /> — inventario', () => {
     expect(screen.getAllByText('Se conserva').length).toBe(1)
   })
 
-  it('no promete borrado en Ligero cuando no hay ningún bloque eliminable que enviar', async () => {
+  it('no promete borrado en el modo por defecto cuando no hay ningún bloque eliminable que enviar', async () => {
     renderView({
       ...EMPTY,
       blocks: [
@@ -303,11 +303,11 @@ describe('<MetaStripView /> — inventario', () => {
     expect(screen.queryAllByText('Se elimina').length).toBe(0)
     expect(screen.getAllByText('Se conserva').length).toBe(1)
 
-    const boton = screen.getByRole('button', { name: 'Limpiar metadata' }) as HTMLButtonElement
+    const boton = screen.getByRole('button', { name: 'Eliminar toda la metadata' }) as HTMLButtonElement
     expect(boton.disabled).toBe(true)
   })
 
-  it('en Profundo sí elimina las entradas eliminables aunque en Ligero no haya bloques', async () => {
+  it('con el switch activado (deep) sí elimina las entradas eliminables aunque en light no haya bloques', async () => {
     renderView({
       ...EMPTY,
       entries: [
@@ -322,11 +322,11 @@ describe('<MetaStripView /> — inventario', () => {
     })
 
     await screen.findByText('Entradas encontradas')
-    fireEvent.click(screen.getByRole('button', { name: /Profundo/ }))
+    fireEvent.click(screen.getByRole('switch', { name: 'Permitir modificar el archivo' }))
 
     await waitFor(() => expect(screen.getAllByText('Se elimina').length).toBe(1))
     expect(statValue('Se eliminarán')).toBe('1')
-    const boton = screen.getByRole('button', { name: 'Regenerar y limpiar todo' }) as HTMLButtonElement
+    const boton = screen.getByRole('button', { name: 'Eliminar toda la metadata' }) as HTMLButtonElement
     expect(boton.disabled).toBe(false)
   })
 
@@ -402,17 +402,17 @@ describe('<MetaStripView /> — inventario', () => {
       ],
     })
 
-    const light = await screen.findByRole('button', { name: 'Limpiar metadata' })
-    fireEvent.click(light)
+    const action = await screen.findByRole('button', { name: 'Eliminar toda la metadata' })
+    fireEvent.click(action)
     expect(onSubmit).toHaveBeenCalledWith({ mode: 'light', blocks: ['id3v2'] })
 
-    fireEvent.click(screen.getByRole('button', { name: /Profundo/ }))
-    fireEvent.click(screen.getByRole('button', { name: 'Regenerar y limpiar todo' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'Permitir modificar el archivo' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Eliminar toda la metadata' }))
     expect(onSubmit).toHaveBeenCalledWith({ mode: 'deep', blocks: [] })
   })
 })
 
-describe('<MetaStripView /> — avisos de regeneración inline', () => {
+describe('<MetaStripView /> — modo y avisos inline', () => {
   const deepRisk: RegenerationRisk = {
     id: 'pdf-forms',
     label: 'Formularios',
@@ -420,52 +420,127 @@ describe('<MetaStripView /> — avisos de regeneración inline', () => {
     severity: 'high',
     affects: 'deep',
   }
+  // Riesgo legado del eje "light": el camino por defecto ya NO modifica el
+  // archivo, así que no debe surfacearse en ningún estado del switch.
   const lightRisk: RegenerationRisk = {
-    id: 'image-orientation',
-    label: 'Orientación EXIF',
-    detail:
-      'El modo ligero re-codifica la imagen para enderezarla según su orientación EXIF: se pierde calidad.',
+    id: 'legacy-light',
+    label: 'Re-codificación',
+    detail: 'Un riesgo ligero legado que ya no debe mostrarse: el modo por defecto no toca el archivo.',
     severity: 'medium',
     affects: 'light',
   }
+  const orientationEntry: MetaEntry = {
+    where: 'Datos de cámara (EXIF/GPS)',
+    key: 'Orientation',
+    label: 'Orientación (se conserva para no girar la foto sin perder calidad)',
+    value: '6',
+    sensitivity: 'low',
+    removal: 'never',
+  }
 
-  it('explica un riesgo profundo dentro de la tarjeta Profundo y lo refleja en el botón', async () => {
+  it('el switch arranca apagado y el botón envía el modo no destructivo (light)', async () => {
+    const onSubmit = renderView({
+      ...EMPTY,
+      blocks: [
+        {
+          id: 'id3v2',
+          label: 'Etiqueta ID3v2',
+          removableIn: 'light',
+          fields: [{ name: 'Título', value: 'Hola', sensitivity: 'low' }],
+        },
+      ],
+      entries: [
+        {
+          where: 'ID3v2 > TIT2',
+          key: 'TIT2',
+          label: 'Título',
+          value: 'Hola',
+          sensitivity: 'low',
+          removal: 'with-container',
+        },
+      ],
+    })
+
+    const toggle = await screen.findByRole('switch', { name: 'Permitir modificar el archivo' })
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+
+    await screen.findByText('Entradas encontradas')
+    fireEvent.click(screen.getByRole('button', { name: 'Eliminar toda la metadata' }))
+    expect(onSubmit).toHaveBeenCalledWith({ mode: 'light', blocks: ['id3v2'] })
+  })
+
+  it('activar el switch envía el modo que permite modificar el archivo (deep)', async () => {
+    const onSubmit = renderView({
+      ...EMPTY,
+      blocks: [
+        {
+          id: 'id3v2',
+          label: 'Etiqueta ID3v2',
+          removableIn: 'light',
+          fields: [{ name: 'Título', value: 'Hola', sensitivity: 'low' }],
+        },
+      ],
+      entries: [
+        {
+          where: 'ID3v2 > TIT2',
+          key: 'TIT2',
+          label: 'Título',
+          value: 'Hola',
+          sensitivity: 'low',
+          removal: 'with-container',
+        },
+      ],
+    })
+
+    const toggle = await screen.findByRole('switch', { name: 'Permitir modificar el archivo' })
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Eliminar toda la metadata' }))
+    expect(onSubmit).toHaveBeenCalledWith({ mode: 'deep', blocks: [] })
+  })
+
+  it('con el switch activado aparecen los avisos de lo que se pierde (deep)', async () => {
     renderView({ ...EMPTY, risks: [deepRisk] })
 
-    const deepCard = await screen.findByRole('button', { name: /Profundo/ })
-    expect(within(deepCard).getByText(deepRisk.detail)).toBeTruthy()
+    // Apagado (por defecto): el aviso profundo no se muestra.
+    await screen.findByRole('switch', { name: 'Permitir modificar el archivo' })
+    expect(screen.queryByText(deepRisk.detail)).toBeNull()
 
-    // Un aviso profundo no contamina la tarjeta Ligero.
-    const lightCard = screen.getByRole('button', { name: /Ligero/ })
-    expect(within(lightCard).queryByText(deepRisk.detail)).toBeNull()
-
-    // En Ligero (por defecto) el botón no refleja un aviso que no aplica.
-    expect(screen.queryByText(/Afecta a:/)).toBeNull()
-
-    // Al elegir Profundo, el propio botón refleja la consecuencia.
-    fireEvent.click(deepCard)
-    const action = screen.getByRole('button', { name: /Regenerar y limpiar todo/ })
-    expect(action.textContent).toContain('Afecta a: Formularios')
+    fireEvent.click(screen.getByRole('switch', { name: 'Permitir modificar el archivo' }))
+    expect(await screen.findByText(deepRisk.detail)).toBeTruthy()
   })
 
-  it('explica un riesgo de re-codificación dentro de la tarjeta Ligero y lo refleja en el botón', async () => {
+  it('con el switch apagado explica la orientación conservada y señala el switch', async () => {
+    renderView({ ...EMPTY, entries: [orientationEntry] })
+
+    // La etiqueta explicativa del escaneo se surfacea (inventario + aviso).
+    expect((await screen.findAllByText(orientationEntry.label as string)).length).toBeGreaterThanOrEqual(2)
+    expect(screen.getByText('Se conserva sin tocar el archivo')).toBeTruthy()
+    expect(screen.getByText(/Activa «Permitir modificar el archivo»/)).toBeTruthy()
+  })
+
+  it('no surfacea riesgos del modo ligero: el camino por defecto es no destructivo', async () => {
     renderView({ ...EMPTY, risks: [lightRisk] })
 
-    const lightCard = await screen.findByRole('button', { name: /Ligero/ })
-    expect(within(lightCard).getByText(lightRisk.detail)).toBeTruthy()
+    await screen.findByRole('switch', { name: 'Permitir modificar el archivo' })
+    expect(screen.queryByText(lightRisk.detail)).toBeNull()
 
-    // Un aviso de re-codificación no contamina la tarjeta Profundo.
-    const deepCard = screen.getByRole('button', { name: /Profundo/ })
-    expect(within(deepCard).queryByText(lightRisk.detail)).toBeNull()
-
-    // Ligero es el modo por defecto: el botón ya refleja el aviso.
-    const action = screen.getByRole('button', { name: /Limpiar metadata/ })
-    expect(action.textContent).toContain('Afecta a: Orientación EXIF')
+    fireEvent.click(screen.getByRole('switch', { name: 'Permitir modificar el archivo' }))
+    expect(screen.queryByText(lightRisk.detail)).toBeNull()
   })
 
-  it('no añade ningún aviso ni ruido cuando el archivo no tiene riesgos', async () => {
+  it('sin nada que advertir no añade avisos ni ruido', async () => {
     renderView({
       ...EMPTY,
+      blocks: [
+        {
+          id: 'id3v2',
+          label: 'Etiqueta ID3v2',
+          removableIn: 'light',
+          fields: [{ name: 'Título', value: 'Hola', sensitivity: 'low' }],
+        },
+      ],
       entries: [
         {
           where: 'ID3v2 > TIT2',
@@ -476,23 +551,17 @@ describe('<MetaStripView /> — avisos de regeneración inline', () => {
           removal: 'individual',
         },
       ],
-      blocks: [
-        {
-          id: 'id3v2',
-          label: 'Etiqueta ID3v2',
-          removableIn: 'light',
-          fields: [{ name: 'Título', value: 'Hola', sensitivity: 'low' }],
-        },
-      ],
     })
 
     await screen.findByText('Hola')
+    expect(screen.queryByText('Se conserva sin tocar el archivo')).toBeNull()
+    expect(screen.queryByText(/Activa «Permitir modificar el archivo»/)).toBeNull()
     expect(screen.queryByText(/Afecta a:/)).toBeNull()
 
-    // Los botones conservan EXACTAMENTE su texto de siempre.
-    expect(screen.getByRole('button', { name: 'Limpiar metadata' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /Profundo/ }))
-    expect(screen.getByRole('button', { name: 'Regenerar y limpiar todo' })).toBeTruthy()
+    // El botón conserva su única etiqueta en ambos estados del switch.
+    expect(screen.getByRole('button', { name: 'Eliminar toda la metadata' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('switch', { name: 'Permitir modificar el archivo' }))
+    expect(screen.getByRole('button', { name: 'Eliminar toda la metadata' })).toBeTruthy()
   })
 
   it('mantiene el contrato de envío { mode, blocks } aunque existan riesgos', async () => {
@@ -519,8 +588,8 @@ describe('<MetaStripView /> — avisos de regeneración inline', () => {
       ],
     })
 
-    fireEvent.click(await screen.findByRole('button', { name: /Profundo/ }))
-    fireEvent.click(screen.getByRole('button', { name: /Regenerar y limpiar todo/ }))
+    fireEvent.click(await screen.findByRole('switch', { name: 'Permitir modificar el archivo' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Eliminar toda la metadata' }))
     expect(onSubmit).toHaveBeenCalledWith({ mode: 'deep', blocks: [] })
   })
 })

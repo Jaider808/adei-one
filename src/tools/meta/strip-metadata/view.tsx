@@ -12,11 +12,17 @@
  *  - verde  = `individual`     → se elimina por sí sola.
  *  - ámbar  = `with-container` → se elimina, pero arrastra su contenedor.
  *  - gris   = `never`          → se conserva (dato técnico o no eliminable por el limpiador).
- * El plan depende del MODO: en Profundo se elimina todo lo eliminable; en
- * Ligero solo si el envío lleva algún bloque eliminable (si no, el botón está
- * deshabilitado y el strip no borra nada). Si un grupo mezcla resultados, cada
- * fila declara el suyo para no mentir. El resumen (total / se eliminan / se
- * conservan / alto riesgo) usa el MISMO criterio que pinta las filas.
+ * El MODO por defecto (`light`) es NO DESTRUCTIVO: elimina toda la metadata que
+ * se pueda quitar por cirugía estructural y NUNCA toca el archivo. El switch
+ * "Permitir modificar el archivo" habilita el modo `deep` (re-codificar la
+ * imagen, rasterizar el PDF), con advertencias inline de lo que se pierde.
+ * Cuando en `light` se conserva algo porque quitarlo exigiría modificar el
+ * archivo (p. ej. la orientación EXIF de una foto), se explica y se señala el
+ * switch como la vía para eliminarlo. Sin avisos no se renderiza ruido.
+ *
+ * Si un grupo mezcla resultados, cada fila declara el suyo para no mentir. El
+ * resumen (total / se eliminan / se conservan / alto riesgo) usa el MISMO
+ * criterio que pinta las filas.
  *
  * Si el kind aún no enumera de forma exhaustiva (PDF, Office, imágenes), el
  * inventario viene vacío y se cae con gracia a la vista por BLOQUES de siempre.
@@ -38,6 +44,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Switch } from '@/components/ui/switch'
 import { cn, formatBytes } from '@/lib/utils'
 import { EMPTY_REPORT } from './domain'
 import type {
@@ -124,18 +131,16 @@ function risksFor(risks: RegenerationRisk[] | undefined, affects: 'deep' | 'ligh
   return (risks ?? []).filter((risk) => risk.affects === affects)
 }
 
-/** Etiquetas de los avisos, recortadas para caber en el botón sin volverse un párrafo. */
-function riskLabelsText(risks: RegenerationRisk[]): string {
-  const labels = risks.map((risk) => risk.label)
-  const shown = labels.slice(0, 3)
-  const joined = shown.join(', ')
-  return labels.length > shown.length ? `${joined} +${labels.length - shown.length}` : joined
-}
-
-/** Severidad más alta presente: manda el aviso de alto riesgo sobre el medio. */
-function highestSeverity(risks: RegenerationRisk[]): 'high' | 'medium' | null {
-  if (risks.length === 0) return null
-  return risks.some((risk) => risk.severity === 'high') ? 'high' : 'medium'
+/**
+ * Entradas que el modo por defecto CONSERVA porque quitarlas exigiría modificar
+ * el archivo: el escaneo las marca `removal: 'never'` con una etiqueta
+ * explicativa ("se conserva…"). No es lo mismo que un dato técnico `never`
+ * (ICC, formato), que se conserva en cualquier modo y no se anuncia aquí.
+ */
+function preservedToAvoidModification(entries: MetaEntry[]): MetaEntry[] {
+  return entries.filter(
+    (entry) => entry.removal === 'never' && /se conserva/i.test(entry.label ?? ''),
+  )
 }
 
 /* ── Subcomponentes (fuera del componente: evita remontajes) ── */
@@ -178,6 +183,44 @@ function RiskList({ risks }: { risks: RegenerationRisk[] }): ReactNode {
         )
       })}
     </span>
+  )
+}
+
+/**
+ * Aviso NEUTRO (nada alarmante) de lo que el modo por defecto conserva porque
+ * quitarlo exigiría modificar el archivo (p. ej. la orientación EXIF de una
+ * foto). Surfacea la etiqueta explicativa del escaneo y señala el switch como
+ * la vía para eliminarlo también. Sin entradas, no se renderiza nada.
+ */
+function PreservedNotice({ entries }: { entries: MetaEntry[] }): ReactNode {
+  if (entries.length === 0) return null
+  return (
+    <div className="flex flex-col gap-1.5 rounded-lg border bg-muted/30 p-2.5">
+      <p className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+        <ShieldCheck
+          className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+          aria-hidden="true"
+        />
+        Se conserva sin tocar el archivo
+      </p>
+      <ul className="flex flex-col gap-1">
+        {entries.map((entry) => (
+          <li key={`${entry.where}-${entry.key}`} className="flex items-start gap-1.5">
+            <span
+              className="mt-1.5 size-1.5 shrink-0 rounded-full bg-muted-foreground/40"
+              aria-hidden="true"
+            />
+            <span className="text-xs leading-relaxed text-muted-foreground">
+              {entry.label ?? entry.key}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        Quitarlo exigiría modificar el archivo. Activa «Permitir modificar el archivo» para
+        eliminarlo también.
+      </p>
+    </div>
   )
 }
 
@@ -564,19 +607,23 @@ export function MetaStripView({ artifact, onSubmit }: ToolViewProps) {
   const useInventory = entryCount > 0
   const canSubmit = mode === 'deep' || deletable.length > 0
 
-  /** Avisos concretos de ESTE archivo, repartidos por la tarjeta del modo que los provoca. */
+  /** Avisos concretos de ESTE archivo que solo se materializan con el switch activo (deep). */
   const deepRisks = useMemo(() => risksFor(report?.risks, 'deep'), [report])
-  const lightRisks = useMemo(() => risksFor(report?.risks, 'light'), [report])
-  /** Avisos del modo elegido: los que el botón debe reflejar. */
-  const activeRisks = mode === 'deep' ? deepRisks : lightRisks
-  const activeSeverity = highestSeverity(activeRisks)
-  const activeRiskText = activeRisks.length > 0 ? `Afecta a: ${riskLabelsText(activeRisks)}` : null
+  /** Lo que el modo por defecto conserva para no modificar el archivo (p. ej. orientación EXIF). */
+  const preservedEntries = useMemo(
+    () => preservedToAvoidModification(report?.entries ?? []),
+    [report],
+  )
 
   function handleSubmit(): void {
     if (!canSubmit) return
     // Ligero borra todos los bloques eliminables; Profundo además regenera.
     const blocks = mode === 'deep' ? [] : deletableIds
     onSubmit({ mode, blocks } as ActionConfig)
+  }
+
+  function handleModeChange(allowModify: boolean): void {
+    setMode(allowModify ? 'deep' : 'light')
   }
 
   function toggleGroup(where: string): void {
@@ -709,64 +756,39 @@ export function MetaStripView({ artifact, onSubmit }: ToolViewProps) {
         <BlocksFallback blocks={report?.blocks ?? []} />
       )}
 
-      {/* Modo de limpieza */}
+      {/* Modo de limpieza: por defecto NO se toca el archivo; el switch habilita modificarlo. */}
       <div className="flex flex-col gap-2.5">
         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Modo de limpieza</p>
-        <div className="grid gap-2.5 sm:grid-cols-2">
-          <button
-            type="button"
-            onClick={() => setMode('light')}
-            className={`rounded-xl border p-3 text-left transition-colors ${
-              mode === 'light' ? 'border-primary bg-accent/60' : 'hover:bg-accent/40'
-            }`}
-          >
-            <span className="flex items-center gap-2 text-sm font-medium">
-              <ShieldCheck className="size-4" aria-hidden="true" /> Ligero · sin tocar tus datos
-            </span>
-            <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
-              Elimina solo los bloques marcados, sin re-codificar (excepto las fotos en vertical: si
-              guardan orientación EXIF se enderezan automáticamente para que no se giren).
-            </span>
-            <RiskList risks={lightRisks} />
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode('deep')}
-            className={`rounded-xl border p-3 text-left transition-colors ${
-              mode === 'deep' ? 'border-primary bg-accent/60' : 'hover:bg-accent/40'
-            }`}
-          >
-            <span className="flex items-center gap-2 text-sm font-medium">
-              <AlertTriangle className="size-4 text-amber-500" aria-hidden="true" /> Profundo · máxima limpieza
-            </span>
-            <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
-              Regenera el archivo para borrar toda la metadata eliminable. Puede alterarlo: el texto de
-              un PDF puede dejar de ser seleccionable, las imágenes se vuelven a comprimir y el peso o
-              la calidad pueden cambiar.
-            </span>
+        <div className="flex flex-col gap-3 rounded-xl border bg-card p-3">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="meta-modify-switch" className="leading-snug">
+                Permitir modificar el archivo
+              </Label>
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {mode === 'deep'
+                  ? 'El archivo puede re-codificarse o rasterizarse: su contenido puede cambiar.'
+                  : 'Por defecto no se toca el archivo: solo se elimina metadata por cirugía estructural.'}
+              </p>
+            </div>
+            <Switch
+              id="meta-modify-switch"
+              checked={mode === 'deep'}
+              onCheckedChange={handleModeChange}
+              aria-label="Permitir modificar el archivo"
+            />
+          </div>
+
+          {mode === 'deep' ? (
             <RiskList risks={deepRisks} />
-          </button>
+          ) : (
+            <PreservedNotice entries={preservedEntries} />
+          )}
         </div>
       </div>
 
-      <Button
-        onClick={handleSubmit}
-        disabled={!canSubmit}
-        className={activeRiskText ? 'h-auto whitespace-normal py-2.5' : undefined}
-      >
-        <span className="flex flex-col items-center gap-0.5">
-          <span>{mode === 'deep' ? 'Regenerar y limpiar todo' : 'Limpiar metadata'}</span>
-          {activeRiskText ? (
-            <span className="flex items-center gap-1 text-xs font-normal text-primary-foreground/90">
-              {activeSeverity === 'high' ? (
-                <AlertTriangle className="size-3.5" aria-hidden="true" />
-              ) : (
-                <span className="size-1.5 rounded-full bg-primary-foreground/70" aria-hidden="true" />
-              )}
-              {activeRiskText}
-            </span>
-          ) : null}
-        </span>
+      <Button onClick={handleSubmit} disabled={!canSubmit}>
+        Eliminar toda la metadata
       </Button>
     </motion.div>
   )

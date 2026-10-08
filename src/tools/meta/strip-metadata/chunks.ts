@@ -101,6 +101,11 @@ function u16beBytes(n: number): Uint8Array {
   return Uint8Array.from([(n >> 8) & 0xff, n & 0xff])
 }
 
+/** Entero → 2 bytes little-endian (nuevo array). */
+function u16leBytes(n: number): Uint8Array {
+  return Uint8Array.from([n & 0xff, (n >> 8) & 0xff])
+}
+
 /** Entero → 4 bytes little-endian (nuevo array). */
 function u32leBytes(n: number): Uint8Array {
   return Uint8Array.from([n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff])
@@ -216,6 +221,65 @@ export function preserveIcc(original: Uint8Array, kind: 'jpg' | 'png' | 'webp', 
   return insertWebpIcc(cleaned, profile)
 }
 
+/* ── EXIF mínimo: conservar SOLO la orientación sin re-codificar ── */
+
+/** Byte order del TIFF: 'II' (little-endian) o 'MM' (big-endian). */
+export type TiffByteOrder = 'II' | 'MM'
+
+/** Prefijo EXIF estándar de los datos crudos de un segmento APP1 ('Exif\0\0'). */
+const EXIF_PREFIX = 'Exif\x00\x00'
+
+/** ¿Unos datos EXIF crudos empiezan por 'Exif\0\0'? (WebP/PNG suelen no llevarlo). */
+function hasExifPrefix(data: Uint8Array): boolean {
+  return data.length >= 6 && String.fromCharCode(...data.slice(0, 6)) === EXIF_PREFIX
+}
+
+/**
+ * Construye un TIFF mínimo con UNA sola entrada IFD0: `Orientation` (tag 0x0112,
+ * tipo SHORT=3, count 1). Conserva el byte order pedido. Layout:
+ * cabecera(8) + nº entradas(2) + entrada(12) + siguiente IFD(4) = 26 bytes.
+ * El valor va en los 2 PRIMEROS bytes del campo de 4 (SHORT en TIFF inline).
+ */
+export function minimalOrientationTiff(orientation: number, byteOrder: TiffByteOrder): Uint8Array {
+  const le = byteOrder === 'II'
+  const u16 = le ? u16leBytes : u16beBytes
+  const u32 = le ? u32leBytes : u32beBytes
+  const value = le
+    ? Uint8Array.of(orientation & 0xff, (orientation >>> 8) & 0xff, 0, 0)
+    : Uint8Array.of((orientation >>> 8) & 0xff, orientation & 0xff, 0, 0)
+  return concat([
+    asciiText(byteOrder), // 'II' | 'MM'
+    u16(0x2a), // magic 42
+    u32(8), // offset a IFD0
+    u16(1), // nº de entradas
+    u16(0x0112), // tag Orientation
+    u16(3), // tipo SHORT
+    u32(1), // count
+    value, // valor en los 2 primeros bytes
+    u32(0), // siguiente IFD: ninguno
+  ])
+}
+
+/**
+ * Datos EXIF mínimos (solo Orientation) a partir de los EXIF originales:
+ * conserva el byte order TIFF y el prefijo 'Exif\0\0' si el original lo llevaba.
+ * Devuelve null si los datos no empiezan por un byte order legible (nunca lanza).
+ */
+export function minimalOrientationExif(originalExif: Uint8Array, orientation: number): Uint8Array | null {
+  const prefixed = hasExifPrefix(originalExif)
+  const start = prefixed ? 6 : 0
+  if (originalExif.length < start + 2) return null
+  const order = String.fromCharCode(originalExif[start], originalExif[start + 1])
+  if (order !== 'II' && order !== 'MM') return null
+  const tiff = minimalOrientationTiff(orientation, order)
+  return prefixed ? concat([asciiText(EXIF_PREFIX), tiff]) : tiff
+}
+
+/** Segmento JPEG completo (marcador + longitud + payload). */
+function jpegSegmentBytes(marker: number, payload: Uint8Array): Uint8Array {
+  return concat([Uint8Array.of(0xff, marker), u16beBytes(2 + payload.length), payload])
+}
+
 /* ── JPEG ── */
 
 /** Marcadores JPEG sin segmento de longitud (SOI, RSTn, TEM). */
@@ -323,6 +387,60 @@ export function stripJpegMetadata(bytes: Uint8Array, blocks?: Set<string>): Uint
       drop = block !== null && blocks.has(block)
     }
     if (!drop) parts.push(bytes.slice(i, segmentEnd))
+    i = segmentEnd
+  }
+  return concat(parts)
+}
+
+/**
+ * Igual que `stripJpegMetadata`, pero cuando el bloque EXIF se elimina y hay un
+ * EXIF mínimo que conservar, lo sustituye EN SU MISMA POSICIÓN (solo el tag
+ * Orientation). El resto de segmentos y los datos de imagen (tras SOS) quedan
+ * byte a byte intactos: no hay canvas, ni re-encode, ni rotación de píxeles.
+ */
+export function stripJpegMetadataKeepingExif(
+  bytes: Uint8Array,
+  blocks: Set<string>,
+  minimalExif: Uint8Array | null,
+): Uint8Array {
+  if (!minimalExif || !blocks.has(BLOCK_EXIF)) return stripJpegMetadata(bytes, blocks)
+  const parts: Uint8Array[] = []
+  let i = 0
+  let replaced = false
+  while (i < bytes.length) {
+    if (bytes[i] !== 0xff) {
+      parts.push(bytes.slice(i, i + 1))
+      i += 1
+      continue
+    }
+    if (i + 1 >= bytes.length) {
+      parts.push(bytes.slice(i))
+      break
+    }
+    const marker = bytes[i + 1]
+    if (marker === 0xd9 || isStandaloneJpegMarker(marker)) {
+      parts.push(bytes.slice(i, i + 2))
+      i += 2
+      if (marker === 0xd9) break
+      continue
+    }
+    if (i + 3 >= bytes.length) {
+      parts.push(bytes.slice(i))
+      break
+    }
+    const length = readU16BE(bytes, i + 2)
+    if (marker === 0xda || length < 2 || i + 2 + length > bytes.length) {
+      parts.push(bytes.slice(i))
+      break
+    }
+    const segmentEnd = i + 2 + length
+    const block = jpegBlockOf(marker, bytes.slice(i + 4, segmentEnd))
+    if (block === BLOCK_EXIF && !replaced) {
+      parts.push(jpegSegmentBytes(0xe1, minimalExif))
+      replaced = true
+    } else if (block === null || !blocks.has(block)) {
+      parts.push(bytes.slice(i, segmentEnd))
+    }
     i = segmentEnd
   }
   return concat(parts)
@@ -482,6 +600,40 @@ export function stripPngMetadata(bytes: Uint8Array, blocks?: Set<string>): Uint8
 }
 
 /**
+ * Igual que `stripPngMetadata`, pero sustituye el chunk `eXIf` por el EXIF
+ * mínimo (solo Orientation) en su misma posición, recalculando su CRC. IDAT y
+ * el resto de chunks quedan intactos: no se tocan los píxeles.
+ */
+export function stripPngMetadataKeepingExif(
+  bytes: Uint8Array,
+  blocks: Set<string>,
+  minimalExif: Uint8Array | null,
+): Uint8Array {
+  if (!minimalExif || !blocks.has(BLOCK_EXIF)) return stripPngMetadata(bytes, blocks)
+  const parts: Uint8Array[] = [bytes.slice(0, PNG_SIGNATURE_LENGTH)]
+  let i = PNG_SIGNATURE_LENGTH
+  let replaced = false
+  while (i + 8 <= bytes.length) {
+    const length = readU32BE(bytes, i)
+    const chunkEnd = i + 12 + length
+    if (chunkEnd > bytes.length) {
+      parts.push(bytes.slice(i))
+      break
+    }
+    const type = asciiAt(bytes, i + 4)
+    const block = pngBlockOf(type)
+    if (type === 'eXIf' && !replaced) {
+      parts.push(pngChunkBytes('eXIf', minimalExif))
+      replaced = true
+    } else if (block === null || !blocks.has(block)) {
+      parts.push(bytes.slice(i, chunkEnd))
+    }
+    i = chunkEnd
+  }
+  return concat(parts)
+}
+
+/**
  * Limpieza PROFUNDA de PNG: elimina además de metadata los chunks de color,
  * densidad y perfiles que suelen añadir los encoders (sRGB/gAMA/cHRM/pHYs…).
  * Conserva SIEMPRE IHDR/PLTE/IDAT/IEND/tRNS (datos visibles).
@@ -564,6 +716,43 @@ export function stripWebpMetadata(bytes: Uint8Array, blocks?: Set<string>): Uint
     const block = webpBlockOf(fourcc)
     const keep = block === null || (blocks !== undefined && !blocks.has(block))
     if (keep) parts.push(bytes.slice(i, chunkEnd))
+    i = chunkEnd + (size & 1)
+  }
+  const out = concat(parts)
+  writeU32LE(out, 4, out.length - 8)
+  return out
+}
+
+/**
+ * Igual que `stripWebpMetadata`, pero sustituye el chunk `EXIF` por el EXIF
+ * mínimo (solo Orientation) en su misma posición, re-escribiendo el tamaño
+ * RIFF. El chunk de imagen (`VP8 `/`VP8L`/`VP8X`) queda intacto: no se
+ * re-codifica nada.
+ */
+export function stripWebpMetadataKeepingExif(
+  bytes: Uint8Array,
+  blocks: Set<string>,
+  minimalExif: Uint8Array | null,
+): Uint8Array {
+  if (!minimalExif || !blocks.has(BLOCK_EXIF)) return stripWebpMetadata(bytes, blocks)
+  if (bytes.length < 12 || asciiAt(bytes, 0) !== 'RIFF' || asciiAt(bytes, 8) !== 'WEBP') {
+    return bytes.slice()
+  }
+  const parts: Uint8Array[] = [bytes.slice(0, 4), bytes.slice(4, 12)]
+  let i = 12
+  let replaced = false
+  while (i + 8 <= bytes.length) {
+    const fourcc = asciiAt(bytes, i)
+    const size = readU32LE(bytes, i + 4)
+    const chunkEnd = i + 8 + size
+    if (chunkEnd > bytes.length) break
+    const block = webpBlockOf(fourcc)
+    if (block === BLOCK_EXIF && !replaced) {
+      parts.push(webpChunkBytes('EXIF', minimalExif))
+      replaced = true
+    } else if (block === null || !blocks.has(block)) {
+      parts.push(bytes.slice(i, chunkEnd))
+    }
     i = chunkEnd + (size & 1)
   }
   const out = concat(parts)

@@ -17,13 +17,19 @@ import {
   listPngChunks,
   listPngText,
   listWebpChunks,
+  minimalOrientationExif,
+  minimalOrientationTiff,
   patchMp4Stco,
+  readU16BE,
   readU32BE,
   stripJpegAllSegments,
   stripJpegMetadata,
+  stripJpegMetadataKeepingExif,
   stripPngDeep,
   stripPngMetadata,
+  stripPngMetadataKeepingExif,
   stripWebpMetadata,
+  stripWebpMetadataKeepingExif,
 } from './chunks'
 
 /* ── Helpers de construcción de fixtures ── */
@@ -369,5 +375,120 @@ describe('perfil ICC JPEG', () => {
     expect(textOf(out)).toContain('KEED')
     expect(out[0]).toBe(0xff)
     expect(out[1]).toBe(0xd8)
+  })
+})
+
+/* ── EXIF mínimo (orientación conservada sin re-codificar) ── */
+
+/** TIFF de referencia: byte order + magic 42 + IFD0 en 8 + una entrada Orientation. */
+function tiffHeader(order: 'II' | 'MM'): Uint8Array {
+  return order === 'II'
+    ? concat([ascii('II'), Uint8Array.of(0x2a, 0x00), Uint8Array.of(8, 0, 0, 0)])
+    : concat([ascii('MM'), Uint8Array.of(0x00, 0x2a), Uint8Array.of(0, 0, 0, 8)])
+}
+
+describe('minimalOrientationTiff', () => {
+  it('little-endian: una sola entrada IFD0 con Orientation en los 2 primeros bytes del valor', () => {
+    const tiff = minimalOrientationTiff(6, 'II')
+    expect(tiff.length).toBe(26) // cabecera(8) + nº entradas(2) + entrada(12) + siguiente IFD(4)
+    expect(tiff.slice(0, 8)).toEqual(tiffHeader('II'))
+    expect(tiff[8] | (tiff[9] << 8)).toBe(1) // 1 entrada
+    expect(tiff[10] | (tiff[11] << 8)).toBe(0x0112) // tag Orientation
+    expect(tiff[12] | (tiff[13] << 8)).toBe(3) // tipo SHORT
+    expect(le32(tiff, 14)).toBe(1) // count
+    expect(tiff[18] | (tiff[19] << 8)).toBe(6) // valor en los 2 primeros bytes
+    expect(tiff[20]).toBe(0)
+    expect(tiff[21]).toBe(0)
+    expect(le32(tiff, 22)).toBe(0) // siguiente IFD: ninguno
+  })
+
+  it('big-endian: conserva MM y escribe el valor en big-endian', () => {
+    const tiff = minimalOrientationTiff(8, 'MM')
+    expect(tiff.length).toBe(26)
+    expect(tiff.slice(0, 8)).toEqual(tiffHeader('MM'))
+    expect(readU16BE(tiff, 8)).toBe(1)
+    expect(readU16BE(tiff, 10)).toBe(0x0112)
+    expect(readU16BE(tiff, 12)).toBe(3)
+    expect(readU32BE(tiff, 14)).toBe(1)
+    expect(readU16BE(tiff, 18)).toBe(8)
+    expect(readU32BE(tiff, 22)).toBe(0)
+  })
+})
+
+describe('minimalOrientationExif', () => {
+  it('conserva el byte order y el prefijo Exif\\0\\0 cuando el original lo llevaba', () => {
+    const original = concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')])
+    const minimal = minimalOrientationExif(original, 6)
+    expect(minimal).not.toBeNull()
+    expect(textOf(minimal!.slice(0, 6))).toBe('Exif\x00\x00')
+    expect(minimal!.slice(6, 14)).toEqual(tiffHeader('II'))
+    expect(minimal!.length).toBe(6 + 26)
+  })
+
+  it('sin prefijo (WebP/PNG): devuelve solo el TIFF', () => {
+    const minimal = minimalOrientationExif(tiffHeader('MM'), 3)
+    expect(minimal).not.toBeNull()
+    expect(minimal!.length).toBe(26)
+    expect(textOf(minimal!.slice(0, 2))).toBe('MM')
+  })
+
+  it('datos no reconocibles → null (nunca lanza)', () => {
+    expect(minimalOrientationExif(ascii('no-exif'), 6)).toBeNull()
+  })
+})
+
+describe('stripJpegMetadataKeepingExif', () => {
+  it('sustituye el APP1-EXIF por el mínimo y conserva el resto byte a byte', () => {
+    const original = concat([
+      Uint8Array.of(0xff, 0xd8),
+      Uint8Array.of(0xff, 0xe1), u16be(2 + 8), concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')]),
+      Uint8Array.of(0xff, 0xdb), u16be(2 + 4), ascii('KEED'),
+      Uint8Array.of(0xff, 0xd9),
+    ])
+    const minimal = minimalOrientationExif(concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')]), 6)!
+    const out = stripJpegMetadataKeepingExif(original, new Set([BLOCK_EXIF]), minimal)
+    expect(textOf(out)).toContain('KEED')
+    expect(out[0]).toBe(0xff)
+    expect(out[1]).toBe(0xd8)
+    expect(out[out.length - 1]).toBe(0xd9)
+    // El EXIF conservado es solo el mínimo, con su prefijo y byte order.
+    expect(textOf(out).slice(6, 12)).toBe('Exif\x00\x00')
+    expect(textOf(out).slice(12, 14)).toBe('II')
+  })
+
+  it('sin mínimo o sin bloque EXIF delega en la cirugía normal', () => {
+    const realExif = concat([
+      Uint8Array.of(0xff, 0xd8),
+      Uint8Array.of(0xff, 0xe1), u16be(2 + 8), concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')]),
+      Uint8Array.of(0xff, 0xd9),
+    ])
+    const out = stripJpegMetadataKeepingExif(realExif, new Set([BLOCK_EXIF]), null)
+    expect(textOf(out)).not.toContain('Exif')
+  })
+})
+
+describe('stripWebpMetadataKeepingExif', () => {
+  it('sustituye el chunk EXIF por el mínimo y re-escribe el tamaño RIFF', () => {
+    const minimal = minimalOrientationExif(tiffHeader('II'), 6)!
+    const out = stripWebpMetadataKeepingExif(WEBP, new Set([BLOCK_EXIF]), minimal)
+    expect(textOf(out)).toContain('VP8 ')
+    expect(textOf(out)).toContain('FRAMEDATA')
+    expect(le32(out, 4)).toBe(out.length - 8)
+    // El chunk EXIF ya no contiene el payload original ('GPSDATA').
+    expect(textOf(out)).not.toContain('GPSDATA')
+    expect(textOf(out)).toContain('EXIF')
+  })
+})
+
+describe('stripPngMetadataKeepingExif', () => {
+  it('sustituye el chunk eXIf por el mínimo y conserva IDAT', () => {
+    const minimal = minimalOrientationExif(tiffHeader('II'), 6)!
+    const out = stripPngMetadataKeepingExif(PNG, new Set([BLOCK_EXIF]), minimal)
+    expect(textOf(out)).toContain('IDAT')
+    expect(textOf(out)).toContain('PIXELES')
+    expect(textOf(out)).toContain('eXIf')
+    expect(textOf(out)).not.toContain('GPS')
+    // El CRC del chunk reescrito debe ser correcto (listPngChunks lo relee).
+    expect(listPngChunks(out).map((c) => c.type)).toEqual(['IHDR', 'IDAT', 'eXIf', 'tEXt', 'IEND'])
   })
 })
