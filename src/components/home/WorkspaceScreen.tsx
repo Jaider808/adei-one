@@ -18,7 +18,6 @@ import { Button } from '@/components/ui/button'
 import { FileDropzone } from '@/components/workspace/FileDropzone'
 import { ActionCard } from '@/components/workspace/ActionCard'
 import { FileBadge } from '@/components/workspace/FileBadge'
-import { RecentActions } from '@/components/workspace/RecentActions'
 import { VisualGuide } from '@/components/home/VisualGuide'
 import { ToolWorkspace } from '@/components/home/ToolWorkspace'
 
@@ -32,7 +31,6 @@ import {
   groupByCategory,
 } from '@/core/catalog'
 import { detectKind, detectKindByMagic } from '@/core/detect'
-import { useHistory } from '@/core/stores/history'
 import { useWorkspace } from '@/core/stores/workspace'
 import { cn } from '@/lib/utils'
 
@@ -57,12 +55,6 @@ const EASE = [0.22, 1, 0.36, 1] as const
 export function WorkspaceScreen() {
   const { artifact, setArtifact, selectedAction, selectAction, reset } = useWorkspace()
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
-  const hydrateHistory = useHistory((state) => state.hydrate)
-
-  // Hidrata "Recientes" una sola vez al montar (almacenamiento desechable).
-  useEffect(() => {
-    void hydrateHistory()
-  }, [hydrateHistory])
 
   useEffect(() => {
     if (!artifact?.file || !IMAGE_KINDS.has(artifact.kind)) {
@@ -220,7 +212,6 @@ export function WorkspaceScreen() {
             </div>
           ) : (
             <>
-              <RecentActions kind={artifact.kind} onSelect={selectAction} />
               <div className="space-y-2">
               <motion.div
                 initial="hidden"

@@ -12,9 +12,7 @@ import { ProgressBar } from '@/components/workflow/ProgressBar'
 import { ResultPanel } from '@/components/workflow/ResultPanel'
 
 import { CATEGORY_LABELS } from '@/core/catalog'
-import { lastConfigFor } from '@/core/history'
 import { saveResult } from '@/core/ports'
-import { useHistory } from '@/core/stores/history'
 import { useWorkflow } from '@/core/stores/workflow'
 import { getToolView, hasProcessor, runTool } from '@/tools/registry'
 import type { Action, ActionConfig, Artifact, FileKind, VerificationResult } from '@/core/types'
@@ -135,8 +133,6 @@ export function ToolWorkspace({ action, artifact, onBack }: ToolWorkspaceProps) 
     reset: resetWorkflow,
   } = useWorkflow()
 
-  const recordRun = useHistory((state) => state.record)
-
   // Verificación posterior a la limpieza devuelta por el motor (solo meta.strip).
   const [verification, setVerification] = useState<VerificationResult | undefined>(undefined)
 
@@ -168,8 +164,6 @@ export function ToolWorkspace({ action, artifact, onBack }: ToolWorkspaceProps) 
         file: new File([out.blob], out.name, { type: mimeForKind(out.kind) }),
         blob: out.blob,
       })
-      // Historial "Recientes": best-effort, jamás rompe la tool (ver core/history).
-      void recordRun({ actionId: action.id, kind: artifact.kind, config })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'No se pudo completar la operación.')
     }
@@ -317,7 +311,6 @@ export function ToolWorkspace({ action, artifact, onBack }: ToolWorkspaceProps) 
                 <ToolBody
                   action={action}
                   artifact={artifact}
-                  defaults={getToolView(action.id) === null ? lastConfigFor(action.id) : undefined}
                   onSubmit={handleSubmit}
                 />
               </ErrorBoundary>

@@ -1,7 +1,13 @@
 # ADR-0003 — Historial local por caché (desechable, sin secretos)
 
-- **Estado:** Aceptado
+- **Estado:** Superseded
 - **Fecha:** 2026-10-07
+
+> **Nota (2026-10-08):** Esta decisión quedó **obsoleta**. El proyecto decidió no
+> almacenar **nada** sobre la actividad de la persona usuaria: sin caché, sin
+> `localStorage`, sin historial en memoria y sin la UI "Recientes". Por eso se
+> eliminaron el módulo de historial, su store y el componente de recientes. El
+> resto del ADR se conserva como registro histórico de la decisión original.
 
 ## Contexto
 Los usuarios repiten los mismos pasos (subir archivo → elegir tool → configurar)

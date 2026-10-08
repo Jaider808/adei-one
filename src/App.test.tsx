@@ -3,8 +3,6 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { beforeEach, describe, expect, it } from 'vitest'
 import { App } from '@/App'
 import { ThemeProvider } from '@/lib/theme'
-import { clear as clearHistory } from '@/core/history'
-import { useHistory } from '@/core/stores/history'
 import { useWorkflow } from '@/core/stores/workflow'
 import { useWorkspace } from '@/core/stores/workspace'
 import type { Artifact } from '@/core/types'
@@ -25,9 +23,6 @@ beforeEach(async () => {
   // Los stores de zustand son singletons y sobreviven entre tests.
   useWorkspace.getState().reset()
   useWorkflow.getState().reset()
-  // El historial persiste en almacenamiento: limpiarlo para aislar los tests.
-  await clearHistory()
-  useHistory.setState({ entries: [], hydrated: false })
 })
 
 function renderApp() {
@@ -117,28 +112,5 @@ describe('<App />', () => {
     fireEvent.click(pendingCard)
     expect(screen.queryByRole('button', { name: /volver/i })).toBeNull()
     expect(screen.queryByText('Cómo dividir')).toBeNull()
-  })
-
-  it('"Recientes" muestra las acciones ya ejecutadas para el formato', async () => {
-    await selectPdfAndWait()
-
-    await act(async () => {
-      await useHistory.getState().record({ actionId: 'pdf.split', kind: 'pdf', config: {} })
-    })
-
-    await screen.findByText('Recientes')
-    expect(screen.getByRole('button', { name: 'Volver a usar Recortar PDF' })).toBeTruthy()
-  })
-
-  it('"Borrar historial" vacía "Recientes" inmediatamente', async () => {
-    await selectPdfAndWait()
-    await act(async () => {
-      await useHistory.getState().record({ actionId: 'pdf.split', kind: 'pdf', config: {} })
-    })
-    await screen.findByText('Recientes')
-
-    fireEvent.click(screen.getByRole('button', { name: 'Borrar historial' }))
-
-    await waitFor(() => expect(screen.queryByText('Recientes')).toBeNull())
   })
 })
