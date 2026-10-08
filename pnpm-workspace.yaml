@@ -1,0 +1,7 @@
+allowBuilds:
+  esbuild: true
+  tesseract.js: true
+# Adei — settings de pnpm (pnpm v10+ lee la config desde aquí, no de package.json)
+# Permite los hooks de build de dependencias que declaran postinstall legítimos.
+onlyBuiltDependencies:
+  - esbuild

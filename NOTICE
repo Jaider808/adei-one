@@ -1,0 +1,53 @@
+ADEI-ONE — Aviso de atribuciones y procedencia (NOTICE)
+=======================================================
+
+ADEI-ONE es una toolbox 100% local: todo el procesamiento ocurre en tu
+navegador y nada sale de tu equipo. Para la herramienta "Eliminar metadata"
+(`meta.strip`) adoptamos TÉCNICAS descritas públicamente por terceros. NO se
+reclama autoría sobre esas técnicas, y NO existe afiliación, patrocinio ni
+respaldo de ningún tipo entre ADEI-ONE y los proyectos citados.
+
+Técnicas adaptadas de terceros
+------------------------------
+
+1. jvoisin/mat2
+   Licencia: GNU Lesser General Public License v3.0 (LGPL-3.0)
+   Aporte: enfoque general de eliminación de metadata y criterio de orientación
+   EXIF (enderezar los píxeles para que la foto no se gire al borrar el tag).
+   Estado: la técnica está implementada en ADEI-ONE.
+   Alcance: NO se ha copiado ni portado código de mat2; se adoptó el enfoque a
+   partir de su descripción pública. Por eso no se reproduce aquí el texto de
+   la LGPL-3.0.
+
+2. iAnonymous3000/metadata-remover
+   Licencia: MIT
+   Aporte: técnica de identificación de Content Credentials (C2PA/JUMBF) y de
+   las cajas XMP `uuid` dentro de contenedores ISO-BMFF (MP4/MOV).
+   Estado: la IDENTIFICACIÓN está implementada hoy (el escaneo clasifica las
+   cajas `uuid` como C2PA, XMP o desconocidas y las muestra en el inventario).
+   La ELIMINACIÓN de esas cajas YA ocurre hoy, pero agrupada en el bloque
+   genérico de "basura" (`free`/`skip`/`wide`/`uuid`), un ítem de baja
+   sensibilidad, y solo cuando ese bloque se selecciona o en modo profundo.
+   Lo que está planificado y todavía NO implementado es tratar Content
+   Credentials (C2PA) como un bloque de privacidad propio, con su etiqueta
+   específica. La distinción identificado ≠ privilegiado sigue siendo real:
+   que la caja sea visible y clasificable no implica que se trate como dato
+   privado dedicado.
+   Alcance: NO se ha copiado código. La obligación de reproducir el aviso MIT
+   aplica solo al distribuir código derivado, y no es el caso; por eso no se
+   reproduce aquí su texto.
+
+Referencias excluidas
+---------------------
+
+- lucasgelfond/exiftool-web: no declara licencia. Por eso NO se cita como
+  fuente de código ni de técnica implementada en ADEI-ONE, y no se insinúa su
+  uso.
+
+Sin afiliación ni respaldo
+--------------------------
+
+ADEI-ONE no está afiliado, patrocinado ni respaldado por ninguno de los
+proyectos anteriores, ni ellos lo están por ADEI-ONE. Las técnicas se adaptan
+de forma independiente y cualquier error es responsabilidad exclusiva de
+ADEI-ONE.

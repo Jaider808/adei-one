@@ -1,0 +1,285 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/sora';
+@import '@fontsource-variable/manrope';
+@import '@fontsource-variable/jetbrains-mono';
+
+/*
+  ============================================================
+  ADEI — Design Tokens (Tailwind v4 + shadcn/ui)
+  ============================================================
+  Patrón (skill tailwind-v4-shadcn):
+  1. Variables CSS en :root y .dark a nivel raíz (NO en @layer)
+  2. .dark para modo oscuro (NO .dark { @theme })
+  3. @theme inline mapea variables → utilidades de Tailwind
+  4. Todos los colores con wrapper hsl()
+  5. Usa SIEMPRE tokens semánticos (bg-primary, text-muted-foreground)
+  Nunca valores sueltos (bg-blue-500) ni dark: manuales.
+  ============================================================
+*/
+
+/* ---------- Tipografías ---------- */
+@theme {
+  --font-sans: 'Manrope Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Sora Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+}
+
+/* ---------- Tema claro (por defecto) ---------- */
+:root {
+  /* Base */
+  --background: hsl(222 30% 97%);
+  --foreground: hsl(228 26% 13%);
+  --card: hsl(0 0% 100%);
+  --card-foreground: hsl(228 26% 13%);
+  --popover: hsl(0 0% 100%);
+  --popover-foreground: hsl(228 26% 13%);
+
+  /* Acento — jade: confianza, privacidad, frescura */
+  --primary: hsl(165 70% 30%);
+  --primary-foreground: hsl(0 0% 100%);
+
+  --secondary: hsl(220 26% 93%);
+  --secondary-foreground: hsl(228 24% 18%);
+
+  --muted: hsl(220 24% 94%);
+  --muted-foreground: hsl(224 12% 45%);
+
+  --accent: hsl(162 62% 92%);
+  --accent-foreground: hsl(228 26% 13%);
+
+  /* Estados */
+  --destructive: hsl(0 72% 51%);
+  --destructive-foreground: hsl(0 0% 100%);
+  --success: hsl(152 62% 34%);
+  --success-foreground: hsl(0 0% 100%);
+  --warning: hsl(38 92% 48%);
+  --warning-foreground: hsl(38 60% 10%);
+  --info: hsl(221 83% 50%);
+  --info-foreground: hsl(0 0% 100%);
+
+  /* Bordes e interacción */
+  --border: hsl(220 20% 89%);
+  --input: hsl(220 20% 87%);
+  --ring: hsl(165 70% 38%);
+
+  --radius: 0.8rem;
+
+  /* Charts / datos */
+  --chart-1: hsl(165 60% 38%);
+  --chart-2: hsl(221 80% 55%);
+  --chart-3: hsl(38 92% 48%);
+  --chart-4: hsl(280 55% 55%);
+  --chart-5: hsl(340 70% 55%);
+}
+
+/* ---------- Tema oscuro (cómodo, no negro puro) ---------- */
+.dark {
+  --background: hsl(226 30% 6.5%);
+  --foreground: hsl(220 22% 92%);
+  --card: hsl(226 26% 9.5%);
+  --card-foreground: hsl(220 22% 92%);
+  --popover: hsl(226 26% 10.5%);
+  --popover-foreground: hsl(220 22% 92%);
+
+  --primary: hsl(160 62% 46%);
+  --primary-foreground: hsl(226 40% 6%);
+
+  --secondary: hsl(226 20% 15%);
+  --secondary-foreground: hsl(220 20% 90%);
+
+  --muted: hsl(226 20% 14%);
+  --muted-foreground: hsl(222 14% 62%);
+
+  --accent: hsl(163 46% 16%);
+  --accent-foreground: hsl(220 20% 92%);
+
+  --destructive: hsl(0 68% 55%);
+  --destructive-foreground: hsl(0 0% 100%);
+  --success: hsl(152 60% 46%);
+  --success-foreground: hsl(226 40% 6%);
+  --warning: hsl(40 94% 55%);
+  --warning-foreground: hsl(40 60% 8%);
+  --info: hsl(221 82% 60%);
+  --info-foreground: hsl(228 30% 6%);
+
+  --border: hsl(226 18% 16%);
+  --input: hsl(226 18% 20%);
+  --ring: hsl(160 62% 50%);
+
+  --chart-1: hsl(160 60% 48%);
+  --chart-2: hsl(221 82% 62%);
+  --chart-3: hsl(40 94% 55%);
+  --chart-4: hsl(280 62% 62%);
+  --chart-5: hsl(340 72% 62%);
+}
+
+/* ---------- Mapeo a utilidades de Tailwind ---------- */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --radius-sm: calc(var(--radius) - 6px);
+  --radius-md: calc(var(--radius) - 3px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 6px);
+
+  /* ---------- Animaciones del design system ---------- */
+  --animate-fade-up: fade-up 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-fade-in: fade-in 0.9s ease both;
+  --animate-float: float 7s ease-in-out infinite;
+  --animate-blob: blob 22s ease-in-out infinite;
+  --animate-shimmer: shimmer 2.4s linear infinite;
+  --animate-pulse-soft: pulse-soft 3.2s ease-in-out infinite;
+  --animate-bounce-soft: bounce-soft 2.4s ease-in-out infinite;
+  --animate-spin-slow: spin 8s linear infinite;
+}
+
+/* ---------- Keyframes ---------- */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(18px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-14px); }
+}
+@keyframes blob {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(30px, -24px) scale(1.08); }
+  66% { transform: translate(-24px, 18px) scale(0.94); }
+}
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.72; transform: scale(0.985); }
+}
+@keyframes bounce-soft {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+
+/* ---------- Base ---------- */
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklab, var(--primary) 22%, transparent);
+    color: var(--foreground);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  /* Scrollbar cómoda (webkit) */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--muted-foreground);
+    opacity: 0.5;
+    border-radius: 999px;
+    border: 3px solid var(--background);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--foreground);
+  }
+}
+
+/* ---------- Transición suave al cambiar tema ---------- */
+html.theme-switching,
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition:
+    background-color 0.45s ease,
+    color 0.45s ease,
+    border-color 0.45s ease,
+    fill 0.45s ease,
+    stroke 0.45s ease,
+    box-shadow 0.45s ease !important;
+}
+
+/* ---------- Utilidades de atmoúfera ---------- */
+@utility bg-dot-grid {
+  background-image: radial-gradient(var(--border) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+@utility text-balance {
+  text-wrap: balance;
+}
+
+/* Ocultar visualmente pero disponible para lectores de pantalla */
+@utility sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="es" class="scroll-smooth">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="ADEI-ONE — Toolbox 100% local. Procesa, convierte y edita tus archivos en tu navegador. Nada sale de tu equipo."
+    />
+    <title>ADEI-ONE · Archivos, 100% en tu navegador</title>
+    <script>
+      // Anti-FOUC: aplica el tema guardado (o sistema) antes del primer paint
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('adei-theme')
+          var theme = stored === 'light' || stored === 'dark' ? stored : 'system'
+          var dark =
+            theme === 'dark' ||
+            (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.classList.add(dark ? 'dark' : 'light')
+          document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+        } catch (e) {}
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
