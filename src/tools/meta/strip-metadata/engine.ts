@@ -64,6 +64,7 @@ import {
 } from './chunks'
 import { EMPTY_REPORT, makeReporter, shortHex } from './domain'
 import { epubDomain } from './epub'
+import { htmlDomain } from './html'
 import { imagePlusDomain } from './image-plus'
 import { odfDomain } from './odf'
 import { rtfDomain } from './rtf'
@@ -1222,6 +1223,7 @@ function domainOf(kind: FileKind) {
   if (videoDomain.kinds.includes(kind)) return videoDomain
   if (imagePlusDomain.kinds.includes(kind)) return imagePlusDomain
   if (svgDomain.kinds.includes(kind)) return svgDomain
+  if (htmlDomain.kinds.includes(kind)) return htmlDomain
   if (odfDomain.kinds.includes(kind)) return odfDomain
   if (epubDomain.kinds.includes(kind)) return epubDomain
   if (rtfDomain.kinds.includes(kind)) return rtfDomain
@@ -1482,7 +1484,7 @@ function stripImageBlocksKeepingOrientation(
 
 /** Formatos sin metadata estándar → passthrough de los mismos bytes. */
 const PLAIN_KINDS: ReadonlySet<FileKind> = new Set([
-  'txt', 'csv', 'xml', 'json', 'html', 'yaml', 'toml', 'zip', 'adei',
+  'txt', 'csv', 'xml', 'json', 'yaml', 'toml', 'zip', 'adei',
 ])
 
 /* ── Engine ── */
