@@ -133,13 +133,14 @@ function risksFor(risks: RegenerationRisk[] | undefined, affects: 'deep' | 'ligh
 
 /**
  * Entradas que el modo por defecto CONSERVA porque quitarlas exigiría modificar
- * el archivo: el escaneo las marca `removal: 'never'` con una etiqueta
- * explicativa ("se conserva…"). No es lo mismo que un dato técnico `never`
- * (ICC, formato), que se conserva en cualquier modo y no se anuncia aquí.
+ * el archivo: el escaneo las marca `removal: 'never'` con `preservedNote`. No es
+ * lo mismo que un dato técnico `never` (ICC, formato), que se conserva en
+ * cualquier modo y no se anuncia aquí. La marca es explícita (campo dedicado),
+ * no se infiere del texto de la etiqueta.
  */
 function preservedToAvoidModification(entries: MetaEntry[]): MetaEntry[] {
   return entries.filter(
-    (entry) => entry.removal === 'never' && /se conserva/i.test(entry.label ?? ''),
+    (entry) => entry.removal === 'never' && entry.preservedNote !== undefined,
   )
 }
 

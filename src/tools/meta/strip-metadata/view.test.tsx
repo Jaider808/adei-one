@@ -436,6 +436,7 @@ describe('<MetaStripView /> — modo y avisos inline', () => {
     value: '6',
     sensitivity: 'low',
     removal: 'never',
+    preservedNote: 'Se conserva para no girar la foto sin perder calidad.',
   }
 
   it('el switch arranca apagado y el botón envía el modo no destructivo (light)', async () => {

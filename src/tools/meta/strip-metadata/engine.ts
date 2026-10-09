@@ -66,6 +66,7 @@ import { EMPTY_REPORT, makeReporter, shortHex } from './domain'
 import { epubDomain } from './epub'
 import { imagePlusDomain } from './image-plus'
 import { odfDomain } from './odf'
+import { rtfDomain } from './rtf'
 import { svgDomain } from './svg'
 import { videoDomain } from './video'
 import type { Reporter, StripConfig } from './domain'
@@ -746,6 +747,9 @@ function pushStructuredExifEntries(meta: Record<string, unknown>, entries: MetaE
         ...(binary ? { size: value.length, hex: shortHex(value) } : {}),
         sensitivity: mapped?.sensitivity ?? (key.startsWith('GPS') ? 'high' : 'medium'),
         removal: technical || preservedOrientation ? 'never' : 'with-container',
+        ...(preservedOrientation
+          ? { preservedNote: 'Se conserva para no girar la foto sin perder calidad.' }
+          : {}),
       })
     }
   }
@@ -1220,6 +1224,7 @@ function domainOf(kind: FileKind) {
   if (svgDomain.kinds.includes(kind)) return svgDomain
   if (odfDomain.kinds.includes(kind)) return odfDomain
   if (epubDomain.kinds.includes(kind)) return epubDomain
+  if (rtfDomain.kinds.includes(kind)) return rtfDomain
   return null
 }
 
@@ -1477,7 +1482,7 @@ function stripImageBlocksKeepingOrientation(
 
 /** Formatos sin metadata estándar → passthrough de los mismos bytes. */
 const PLAIN_KINDS: ReadonlySet<FileKind> = new Set([
-  'txt', 'csv', 'xml', 'json', 'html', 'yaml', 'toml', 'zip', 'rtf', 'adei',
+  'txt', 'csv', 'xml', 'json', 'html', 'yaml', 'toml', 'zip', 'adei',
 ])
 
 /* ── Engine ── */

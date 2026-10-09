@@ -576,6 +576,11 @@ describe('stripMetadata — light lossless', () => {
     const result = await stripMetadata(eng(source, 'vertical.jpg', 'jpg', { mode: 'light', blocks: ['exif'] }))
     const out = await bytesOf(result)
 
+    // La verificación posterior confirma que no queda metadata eliminable: la
+    // orientación conservada está marcada `never` y NO cuenta como resto. Si se
+    // etiquetara como eliminable, este caso pasaría a 'remaining' y fallaría.
+    expect(result.verification?.status).toBe('clean')
+
     // (a) Los datos de imagen tras SOS quedan byte a byte idénticos: no hubo re-encode.
     const from = sosIndex(source)
     expect(from).toBeGreaterThan(0)

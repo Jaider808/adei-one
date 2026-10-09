@@ -195,6 +195,13 @@ export interface MetaEntry {
   sensitivity: 'high' | 'medium' | 'low'
   /** individual = borrable solo; with-container = arrastra su contenedor; never = técnico */
   removal: MetaRemoval
+  /**
+   * Presente cuando la entrada se conserva por un motivo que el usuario debe
+   * conocer (p. ej. quitarla exigiría modificar el archivo). Marca explícita
+   * que la vista surfacea en el aviso de conservación; no se deriva del texto
+   * de la etiqueta.
+   */
+  preservedNote?: string
 }
 
 /**

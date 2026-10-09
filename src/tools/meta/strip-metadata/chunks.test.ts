@@ -11,6 +11,7 @@ import {
   BLOCK_XMP,
   asciiAt,
   concat,
+  crc32,
   extractIcc,
   insertJpegIcc,
   insertWebpIcc,
@@ -473,7 +474,7 @@ describe('stripJpegMetadataKeepingExif', () => {
   it('sustituye el APP1-EXIF por el mínimo y conserva el resto byte a byte', () => {
     const original = concat([
       Uint8Array.of(0xff, 0xd8),
-      Uint8Array.of(0xff, 0xe1), u16be(2 + 8), concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')]),
+      Uint8Array.of(0xff, 0xe1), u16be(2 + 14), concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')]),
       Uint8Array.of(0xff, 0xdb), u16be(2 + 4), ascii('KEED'),
       Uint8Array.of(0xff, 0xd9),
     ])
@@ -491,7 +492,7 @@ describe('stripJpegMetadataKeepingExif', () => {
   it('sin mínimo o sin bloque EXIF delega en la cirugía normal', () => {
     const realExif = concat([
       Uint8Array.of(0xff, 0xd8),
-      Uint8Array.of(0xff, 0xe1), u16be(2 + 8), concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')]),
+      Uint8Array.of(0xff, 0xe1), u16be(2 + 14), concat([ascii('Exif'), Uint8Array.of(0, 0), tiffHeader('II')]),
       Uint8Array.of(0xff, 0xd9),
     ])
     const out = stripJpegMetadataKeepingExif(realExif, new Set([BLOCK_EXIF]), null)
@@ -520,8 +521,14 @@ describe('stripPngMetadataKeepingExif', () => {
     expect(textOf(out)).toContain('PIXELES')
     expect(textOf(out)).toContain('eXIf')
     expect(textOf(out)).not.toContain('GPS')
-    // El CRC del chunk reescrito debe ser correcto (listPngChunks lo relee).
-    expect(listPngChunks(out).map((c) => c.type)).toEqual(['IHDR', 'IDAT', 'eXIf', 'tEXt', 'IEND'])
+    // `listPngChunks` NO valida el CRC: se comprueba explícitamente que el CRC
+    // del chunk eXIf reescrito es el correcto (recalculado sobre type+data).
+    const chunks = listPngChunks(out)
+    expect(chunks.map((c) => c.type)).toEqual(['IHDR', 'IDAT', 'eXIf', 'tEXt', 'IEND'])
+    const exif = chunks.find((c) => c.type === 'eXIf')!
+    const storedCrc = readU32BE(out, exif.start + 8 + exif.data.length)
+    const computedCrc = crc32(out.slice(exif.start + 4, exif.start + 8 + exif.data.length))
+    expect(storedCrc).toBe(computedCrc)
   })
 })
 
